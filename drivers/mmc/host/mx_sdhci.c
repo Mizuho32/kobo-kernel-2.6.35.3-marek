@@ -2733,6 +2733,70 @@ static int kobowm_light_hostinit_read(char *page, char **start, off_t off,
 	return len;
 }
 
+/* KoboWM Track L 9 (mds/wifi-hostsleep/trackL-09-*.md): read-only diagnostic
+ * exposing the WiFi host's raw register state after a given resume/reinit
+ * path, WITHOUT assuming clock is the only thing sdhci_reset(SDHCI_RESET_
+ * ALL) disrupts -- deliberately checks more than one candidate at once:
+ *
+ * 1. SDHCI_CLOCK_CONTROL: is the SD clock output actually enabled
+ *    (SDHCI_CLOCK_SD_EN), and are the "disable auto-gate for
+ *    compatibility" bits (PER_EN/HLK_EN/IPG_EN, set in sdhci_set_clock(),
+ *    but that function is confirmed to never run on the real keep-power
+ *    resume path) actually present?
+ * 2. SDHCI_HOST_CONTROL: bus-width (4BITBUS) and high-speed (HISPD) bits.
+ *    Reading sdhci_reset() closely: for a NON-ALL reset it saves/restores
+ *    this register (reg_save), but for SDHCI_RESET_ALL specifically it
+ *    does NOT -- meaning bus width silently reverts to the hardware
+ *    power-on default (1-bit) and is never told to the card, a completely
+ *    separate desync mechanism from clock loss.
+ *
+ * Point is to observe raw register state directly (pseudo-test, no real
+ * suspend needed) rather than jumping to "just keep the clock alive" as
+ * the fix before checking what else SDHCI_RESET_ALL leaves disturbed. */
+static int kobowm_clock_status_read(char *page, char **start, off_t off,
+				     int count, int *eof, void *data)
+{
+	struct sdhci_chip *chip = mxc_fix_chips[2];
+	u32 clk_ctrl, host_ctrl, present_state;
+	int len;
+
+	if (!chip || !chip->hosts[0]) {
+		len = snprintf(page, count, "mxc_fix_chips[2] not ready\n");
+		*eof = 1;
+		return len;
+	}
+
+	clk_ctrl = readl(chip->hosts[0]->ioaddr + SDHCI_CLOCK_CONTROL);
+	host_ctrl = readl(chip->hosts[0]->ioaddr + SDHCI_HOST_CONTROL);
+	present_state = readl(chip->hosts[0]->ioaddr + SDHCI_PRESENT_STATE);
+
+	len = snprintf(page, count,
+		       "host->clock (sw cache) = %u Hz\n"
+		       "SDHCI_CLOCK_CONTROL    = 0x%08x\n"
+		       "  SD_EN  (clock output enabled) = %d\n"
+		       "  PER_EN (auto-gate disable)    = %d\n"
+		       "  HLK_EN (auto-gate disable)    = %d\n"
+		       "  IPG_EN (auto-gate disable)    = %d\n"
+		       "SDHCI_HOST_CONTROL     = 0x%08x\n"
+		       "  4BITBUS (bus width 4-bit)     = %d\n"
+		       "  HISPD   (high speed mode)     = %d\n"
+		       "  ADMA    (ADMA enabled)        = %d\n"
+		       "SDHCI_PRESENT_STATE    = 0x%08x\n",
+		       chip->hosts[0]->clock,
+		       clk_ctrl,
+		       !!(clk_ctrl & SDHCI_CLOCK_SD_EN),
+		       !!(clk_ctrl & SDHCI_CLOCK_PER_EN),
+		       !!(clk_ctrl & SDHCI_CLOCK_HLK_EN),
+		       !!(clk_ctrl & SDHCI_CLOCK_IPG_EN),
+		       host_ctrl,
+		       !!(host_ctrl & SDHCI_CTRL_4BITBUS),
+		       !!(host_ctrl & SDHCI_CTRL_HISPD),
+		       !!(host_ctrl & SDHCI_CTRL_ADMA),
+		       present_state);
+	*eof = 1;
+	return len;
+}
+
 /* KoboWM Track L (mds/wifi-hostsleep/trackL-05-*.md): claim-and-hold pair.
  * mmc_claim_host()/mmc_release_host() (drivers/mmc/core/core.c) is a
  * recursive-per-task mutex (host->claimer == current, host->claim_cnt
@@ -2943,6 +3007,13 @@ static int __init sdhci_drv_init(void)
 	} else
 		printk(KERN_ERR "[KoboWM-light-hostinit] failed to create "
 		       "/proc/kobowm_light_hostinit\n");
+
+	pe = create_proc_entry("kobowm_clock_status", 0444, NULL);
+	if (pe)
+		pe->read_proc = kobowm_clock_status_read;
+	else
+		printk(KERN_ERR "[KoboWM-clock-status] failed to create "
+		       "/proc/kobowm_clock_status\n");
 
 	pe = create_proc_entry("kobowm_mmc_claim", 0200, NULL);
 	if (pe)
