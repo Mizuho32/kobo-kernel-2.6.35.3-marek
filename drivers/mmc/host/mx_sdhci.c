@@ -2667,6 +2667,9 @@ extern int mmc_io_rw_direct(struct mmc_card *card, int write, unsigned fn,
 extern int mmc_io_rw_extended(struct mmc_card *card, int write, unsigned fn,
 			       unsigned addr, int incr_addr, u8 *buf,
 			       unsigned blocks, unsigned blksz);
+/* Not EXPORT_SYMBOL'd either, same link-time resolution as above. */
+extern void mmc_set_bus_width(struct mmc_host *host, unsigned int width);
+extern void mmc_set_clock(struct mmc_host *host, unsigned int hz);
 
 /* KoboWM Track L (mds/wifi-hostsleep/trackL-01-wiced-evidence-and-pivot.md):
  * toggle for drivers/mmc/core/sdio.c's kobowm_light_resume fast path (skip
@@ -2802,11 +2805,21 @@ static int kobowm_clock_status_read(char *page, char **start, off_t off,
  * kobowm_step_test bit2), so /proc/kobowm_clock_status can observe the
  * exact register state right after it, on this branch (which stripped the
  * full step_test decomposition infra when reverted to the Track L 5
- * baseline). Any write triggers it, value is ignored. */
+ * baseline). Optional bitmask argument (default 0 = just sdhci_init()):
+ * bit0 (0x1) = immediately restore clock via mmc_set_clock() (re-applies
+ * the auto-gate-disable bits as a side effect of sdhci_set_ios(), same as
+ * trackL-07's bit5 test); bit1 (0x2) = immediately restore host-side bus
+ * width to 4-bit via mmc_set_bus_width() (also triggers sdhci_set_ios(),
+ * so combined with bit0 this is redundant for clock but adds the
+ * HOST_CONTROL 4BITBUS fix trackL-07 never tried). Both use the card's
+ * existing ios/CCCR state, no CMD52 renegotiation with the card. */
 static int kobowm_hostinit_test_write(struct file *file, const char *buf,
 				       unsigned long count, void *data)
 {
 	struct sdhci_chip *chip = mxc_fix_chips[2];
+	char kbuf[16];
+	unsigned long n = count < sizeof(kbuf) - 1 ? count : sizeof(kbuf) - 1;
+	unsigned long mode = 0;
 
 	if (!chip || !chip->hosts[0]) {
 		printk(KERN_ERR "[KoboWM-hostinit-test] mxc_fix_chips[2] not "
@@ -2814,8 +2827,28 @@ static int kobowm_hostinit_test_write(struct file *file, const char *buf,
 		return count;
 	}
 
-	printk(KERN_ERR "[KoboWM-hostinit-test] sdhci_init()\n");
+	if (!copy_from_user(kbuf, buf, n)) {
+		kbuf[n] = '\0';
+		mode = simple_strtoul(kbuf, NULL, 10);
+	}
+
+	printk(KERN_ERR "[KoboWM-hostinit-test] sdhci_init() (mode=0x%lx)\n",
+	       mode);
 	sdhci_init(chip->hosts[0]);
+
+	if (mode & 0x1) {
+		printk(KERN_ERR "[KoboWM-hostinit-test] restoring clock "
+		       "(mmc_set_clock, %u Hz)\n",
+		       chip->hosts[0]->mmc->ios.clock);
+		mmc_set_clock(chip->hosts[0]->mmc,
+			      chip->hosts[0]->mmc->ios.clock);
+	}
+	if (mode & 0x2) {
+		printk(KERN_ERR "[KoboWM-hostinit-test] restoring bus width "
+		       "(mmc_set_bus_width, MMC_BUS_WIDTH_4)\n");
+		mmc_set_bus_width(chip->hosts[0]->mmc, MMC_BUS_WIDTH_4);
+	}
+
 	printk(KERN_ERR "[KoboWM-hostinit-test] done\n");
 	return count;
 }
