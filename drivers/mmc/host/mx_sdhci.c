@@ -2797,6 +2797,29 @@ static int kobowm_clock_status_read(char *page, char **start, off_t off,
 	return len;
 }
 
+/* KoboWM Track L 9 (mds/wifi-hostsleep/trackL-09-*.md): minimal write-only
+ * trigger for sdhci_init() alone (matching Track L 6-8's now-removed
+ * kobowm_step_test bit2), so /proc/kobowm_clock_status can observe the
+ * exact register state right after it, on this branch (which stripped the
+ * full step_test decomposition infra when reverted to the Track L 5
+ * baseline). Any write triggers it, value is ignored. */
+static int kobowm_hostinit_test_write(struct file *file, const char *buf,
+				       unsigned long count, void *data)
+{
+	struct sdhci_chip *chip = mxc_fix_chips[2];
+
+	if (!chip || !chip->hosts[0]) {
+		printk(KERN_ERR "[KoboWM-hostinit-test] mxc_fix_chips[2] not "
+		       "ready\n");
+		return count;
+	}
+
+	printk(KERN_ERR "[KoboWM-hostinit-test] sdhci_init()\n");
+	sdhci_init(chip->hosts[0]);
+	printk(KERN_ERR "[KoboWM-hostinit-test] done\n");
+	return count;
+}
+
 /* KoboWM Track L (mds/wifi-hostsleep/trackL-05-*.md): claim-and-hold pair.
  * mmc_claim_host()/mmc_release_host() (drivers/mmc/core/core.c) is a
  * recursive-per-task mutex (host->claimer == current, host->claim_cnt
@@ -3015,6 +3038,13 @@ static int __init sdhci_drv_init(void)
 		printk(KERN_ERR "[KoboWM-clock-status] failed to create "
 		       "/proc/kobowm_clock_status\n");
 
+	pe = create_proc_entry("kobowm_hostinit_test", 0200, NULL);
+	if (pe)
+		pe->write_proc = kobowm_hostinit_test_write;
+	else
+		printk(KERN_ERR "[KoboWM-hostinit-test] failed to create "
+		       "/proc/kobowm_hostinit_test\n");
+
 	pe = create_proc_entry("kobowm_mmc_claim", 0200, NULL);
 	if (pe)
 		pe->write_proc = kobowm_mmc_claim_write;
@@ -3041,6 +3071,8 @@ static void __exit sdhci_drv_exit(void)
 	remove_proc_entry("kobowm_mmc_rescan", NULL);
 	remove_proc_entry("kobowm_light_resume", NULL);
 	remove_proc_entry("kobowm_light_hostinit", NULL);
+	remove_proc_entry("kobowm_clock_status", NULL);
+	remove_proc_entry("kobowm_hostinit_test", NULL);
 	remove_proc_entry("kobowm_mmc_claim", NULL);
 	remove_proc_entry("kobowm_mmc_release", NULL);
 	platform_driver_unregister(&sdhci_driver);
