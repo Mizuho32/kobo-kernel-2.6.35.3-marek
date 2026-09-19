@@ -2854,6 +2854,7 @@ static int kobowm_hostinit_test_write(struct file *file, const char *buf,
 	char kbuf[16];
 	unsigned long n = count < sizeof(kbuf) - 1 ? count : sizeof(kbuf) - 1;
 	unsigned long mode = 0;
+	u32 reg_save_test;
 
 	if (!chip || !chip->hosts[0]) {
 		printk(KERN_ERR "[KoboWM-hostinit-test] mxc_fix_chips[2] not "
@@ -2900,6 +2901,124 @@ static int kobowm_hostinit_test_write(struct file *file, const char *buf,
 			printk(KERN_ERR "[KoboWM-hostinit-test] done\n");
 			return count;
 		}
+	}
+
+	if (mode & 0x10) {
+		/* KoboWM Track L 9 (user hypothesis): sdhci_reset()'s ALL and
+		 * non-ALL branches are mutually exclusive in the real
+		 * function -- ALL zeroes host->clock and skips the raw
+		 * HOST_CONTROL save/restore (L211-214, L238); non-ALL does
+		 * the opposite. mode=0x1/0x2 already tested restoring clock/
+		 * buswidth via the HEAVY mmc_set_clock()/mmc_set_bus_width()
+		 * path (which goes through sdhci_set_ios(), touching more
+		 * than just these two registers) -- this mode instead
+		 * triggers the REAL SRST_ALL hardware bit while applying
+		 * EXACTLY the non-ALL branch's raw software treatment
+		 * (verbatim reg_save/restore around it, host->clock left
+		 * untouched), bypassing sdhci_reset()'s mutual exclusivity
+		 * entirely. Answers: is it purely the HW trigger bit value
+		 * that matters (this would still break), or does the
+		 * surrounding SW bookkeeping omission on the ALL path
+		 * matter too (this might not break)? */
+		u32 clk_tmp, sig_tmp;
+		unsigned long poll = 5000;
+
+		printk(KERN_ERR "[KoboWM-hostinit-test] custom: real ALL "
+		       "trigger + non-ALL's raw save/restore (mode=0x%lx)\n",
+		       mode);
+
+		/* non-ALL branch's software treatment: save HOST_CONTROL,
+		 * do NOT zero host->clock. */
+		reg_save_test = readl(chip->hosts[0]->ioaddr +
+				       SDHCI_HOST_CONTROL);
+
+		clk_tmp = readl(chip->hosts[0]->ioaddr + SDHCI_CLOCK_CONTROL)
+			  | (SDHCI_RESET_ALL << 24);
+		sig_tmp = readl(chip->hosts[0]->ioaddr + SDHCI_SIGNAL_ENABLE);
+		writel(clk_tmp, chip->hosts[0]->ioaddr + SDHCI_CLOCK_CONTROL);
+
+		while ((readl(chip->hosts[0]->ioaddr + SDHCI_CLOCK_CONTROL)
+			>> 24) & SDHCI_RESET_ALL) {
+			if (poll == 0) {
+				printk(KERN_ERR "[KoboWM-hostinit-test] "
+				       "custom reset never completed\n");
+				return count;
+			}
+			poll--;
+			udelay(20);
+		}
+
+		/* non-ALL branch's post-reset restore, done unconditionally
+		 * here (real code gates this on !(mask & ALL)). */
+		writel(reg_save_test, chip->hosts[0]->ioaddr +
+				       SDHCI_HOST_CONTROL);
+		if (chip->hosts[0]->flags & SDHCI_USE_DMA)
+			sig_tmp &= ~(SDHCI_INT_DATA_AVAIL |
+				     SDHCI_INT_SPACE_AVAIL);
+		if (mxc_wml_value == 512)
+			writel(SDHCI_WML_128_WORDS, chip->hosts[0]->ioaddr +
+							SDHCI_WML);
+		else
+			writel(SDHCI_WML_16_WORDS, chip->hosts[0]->ioaddr +
+						       SDHCI_WML);
+		writel(sig_tmp | SDHCI_INT_CARD_INT, chip->hosts[0]->ioaddr +
+							 SDHCI_INT_ENABLE);
+		writel(sig_tmp, chip->hosts[0]->ioaddr + SDHCI_SIGNAL_ENABLE);
+
+		printk(KERN_ERR "[KoboWM-hostinit-test] done\n");
+		return count;
+	}
+
+	if (mode & 0x20) {
+		/* KoboWM Track L 9 (symmetric counterpart to mode=0x10):
+		 * trigger the SAFE CMD|DATA hardware bits, but apply ALL's
+		 * software treatment instead (zero host->clock, skip the
+		 * HOST_CONTROL save/restore) -- tests whether CMD|DATA's
+		 * safety depends on its own reg_save/restore, or whether
+		 * it's safe regardless because the HW trigger bit choice is
+		 * what actually matters. */
+		u32 clk_tmp, sig_tmp;
+		unsigned long poll = 5000;
+
+		printk(KERN_ERR "[KoboWM-hostinit-test] custom: CMD|DATA "
+		       "trigger + ALL's treatment, no save/restore "
+		       "(mode=0x%lx)\n", mode);
+
+		chip->hosts[0]->clock = 0;
+
+		clk_tmp = readl(chip->hosts[0]->ioaddr + SDHCI_CLOCK_CONTROL)
+			  | ((SDHCI_RESET_CMD | SDHCI_RESET_DATA) << 24);
+		sig_tmp = readl(chip->hosts[0]->ioaddr + SDHCI_SIGNAL_ENABLE);
+		writel(clk_tmp, chip->hosts[0]->ioaddr + SDHCI_CLOCK_CONTROL);
+
+		while ((readl(chip->hosts[0]->ioaddr + SDHCI_CLOCK_CONTROL)
+			>> 24) & (SDHCI_RESET_CMD | SDHCI_RESET_DATA)) {
+			if (poll == 0) {
+				printk(KERN_ERR "[KoboWM-hostinit-test] "
+				       "custom reset never completed\n");
+				return count;
+			}
+			poll--;
+			udelay(20);
+		}
+
+		/* ALL branch never restores HOST_CONTROL -- skip it here
+		 * too (this is the point of the test). */
+		if (chip->hosts[0]->flags & SDHCI_USE_DMA)
+			sig_tmp &= ~(SDHCI_INT_DATA_AVAIL |
+				     SDHCI_INT_SPACE_AVAIL);
+		if (mxc_wml_value == 512)
+			writel(SDHCI_WML_128_WORDS, chip->hosts[0]->ioaddr +
+							SDHCI_WML);
+		else
+			writel(SDHCI_WML_16_WORDS, chip->hosts[0]->ioaddr +
+						       SDHCI_WML);
+		writel(sig_tmp | SDHCI_INT_CARD_INT, chip->hosts[0]->ioaddr +
+							 SDHCI_INT_ENABLE);
+		writel(sig_tmp, chip->hosts[0]->ioaddr + SDHCI_SIGNAL_ENABLE);
+
+		printk(KERN_ERR "[KoboWM-hostinit-test] done\n");
+		return count;
 	}
 
 	if (mode & 0x4) {
