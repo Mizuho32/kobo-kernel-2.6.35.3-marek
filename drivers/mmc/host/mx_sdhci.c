@@ -2844,6 +2844,28 @@ static int kobowm_hostinit_test_write(struct file *file, const char *buf,
 		mode = simple_strtoul(kbuf, NULL, 10);
 	}
 
+	if (mode & 0x8) {
+		/* KoboWM Track L 9: the purest possible test -- no
+		 * sdhci_reset() call at all, just a raw direct clear+
+		 * restore of SDHCI_CLOCK_CONTROL's SD_EN bit around a brief
+		 * delay, isolating a bare clock-output interruption from
+		 * every other side effect SDHCI_RESET_ALL might have.
+		 * Bypasses sdhci_init()/sdhci_restore_int_regs() entirely
+		 * when this bit is set (mutually exclusive with 0x1/0x2/0x4
+		 * for this run). */
+		u32 clk = readl(chip->hosts[0]->ioaddr + SDHCI_CLOCK_CONTROL);
+		printk(KERN_ERR "[KoboWM-hostinit-test] raw SD_EN toggle: "
+		       "clearing (clk=0x%08x)\n", clk);
+		writel(clk & ~SDHCI_CLOCK_SD_EN,
+		       chip->hosts[0]->ioaddr + SDHCI_CLOCK_CONTROL);
+		msleep(20);
+		printk(KERN_ERR "[KoboWM-hostinit-test] raw SD_EN toggle: "
+		       "restoring exact prior value\n");
+		writel(clk, chip->hosts[0]->ioaddr + SDHCI_CLOCK_CONTROL);
+		printk(KERN_ERR "[KoboWM-hostinit-test] done\n");
+		return count;
+	}
+
 	if (mode & 0x4) {
 		printk(KERN_ERR "[KoboWM-hostinit-test] sdhci_reset(CMD|DATA)"
 		       " instead of ALL (mode=0x%lx)\n", mode);
