@@ -317,7 +317,7 @@ static int proc_pid_wchan(struct task_struct *task, char *buffer)
 }
 #endif /* CONFIG_KALLSYMS */
 
-#ifdef CONFIG_STACKTRACE
+#if 1 /* KoboWM: force-enable /proc/pid/stack for debugging, CONFIG_STACKTRACE isn't selectable in this .config */
 
 #define MAX_STACK_TRACE_DEPTH	64
 
@@ -2608,7 +2608,7 @@ static const struct pid_entry tgid_base_stuff[] = {
 #ifdef CONFIG_KALLSYMS
 	INF("wchan",      S_IRUGO, proc_pid_wchan),
 #endif
-#ifdef CONFIG_STACKTRACE
+#if 1
 	ONE("stack",      S_IRUSR, proc_pid_stack),
 #endif
 #ifdef CONFIG_SCHEDSTATS
@@ -2942,7 +2942,7 @@ static const struct pid_entry tid_base_stuff[] = {
 #ifdef CONFIG_KALLSYMS
 	INF("wchan",     S_IRUGO, proc_pid_wchan),
 #endif
-#ifdef CONFIG_STACKTRACE
+#if 1
 	ONE("stack",      S_IRUSR, proc_pid_stack),
 #endif
 #ifdef CONFIG_SCHEDSTATS

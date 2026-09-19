@@ -40,7 +40,10 @@
 #endif //]GPIOFN_PWRKEY
 
 
-//#define _WIFI_ALWAYS_ON_	// wifi always on for startic
+#define _WIFI_ALWAYS_ON_	// wifi always on for startic -- KoboWM host-sleep Phase 1: skip ntx_gpio_suspend()'s
+				// unconditional WiFi 3V3/RST GPIO power-cut so power survives suspend when we want it to.
+				// Does not affect ntx_wifi_power_ctrl(0) (rmmod path), which still cuts power unconditionally --
+				// the existing interim rmmod-based suspend fix is unaffected. See mds/wifi-hostsleep/.
 //#define DIGITIZER_TEST		// PVI digitizer test
 
 #include "ntx_hwconfig.h"

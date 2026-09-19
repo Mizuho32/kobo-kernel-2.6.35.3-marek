@@ -3,7 +3,7 @@
 
 struct task_struct;
 
-#ifdef CONFIG_STACKTRACE
+#if 1 /* KoboWM: force-enable, see fs/proc/base.c */
 struct task_struct;
 
 struct stack_trace {

@@ -24,6 +24,24 @@
 #include "sdio_ops.h"
 #include "sdio_cis.h"
 
+/*
+ * KoboWM Track L (mds/wifi-hostsleep/trackL-01-wiced-evidence-and-pivot.md):
+ * mmc_sdio_init_card()'s powered_resume fast path already skips CMD5/CMD3/
+ * CMD7 renegotiation when MMC_PM_KEEP_POWER is set (card was never actually
+ * powered off), but still unconditionally re-reads CCCR + the full CIS tuple
+ * chain -- exactly the operation whose CMD53 traffic has produced every
+ * "Timeout waiting for hardware interrupt"/"Division by zero" reproduction
+ * in this project's dwell sweeps (the "queuing unknown CIS tuple" warnings
+ * immediately precede them). If the card was genuinely never powered off,
+ * this re-read is redundant: the CCCR/CIS content can't have changed.
+ * Runtime-toggleable (default off) so the existing dwell-sweep test scripts
+ * (bin/wifi-hostsleep/device-scripts/attempt18-dwell-threshold.sh via
+ * fresh_chip_dwell_sweep.sh) can A/B test with zero script changes --
+ * flipped via mx_sdhci.c's /proc/kobowm_light_resume.
+ */
+int kobowm_light_resume = 0;
+EXPORT_SYMBOL(kobowm_light_resume);
+
 static int sdio_read_fbr(struct sdio_func *func)
 {
 	int ret;
@@ -321,6 +339,15 @@ static int mmc_sdio_init_card(struct mmc_host *host, u32 ocr,
 			goto remove;
 	}
 
+	if (powered_resume && oldcard && kobowm_light_resume) {
+		/* Track L: card was never powered off, trust oldcard's
+		 * already-known CCCR/CIS instead of re-reading over SDIO --
+		 * see the kobowm_light_resume comment above. */
+		mmc_remove_card(card);
+		card = oldcard;
+		return 0;
+	}
+
 	/*
 	 * Read the common registers.
 	 */
@@ -490,7 +517,25 @@ static int mmc_sdio_resume(struct mmc_host *host)
 	if (!err)
 		/* We may have switched to 1-bit mode during suspend. */
 		err = sdio_enable_wide(host->card);
-	if (!err && host->sdio_irqs)
+	/* KoboWM Track L (mds/wifi-hostsleep/trackL-03-*.md): mmc_signal_sdio_irq()
+	 * wakes host->sdio_irq_thread to proactively re-check for a missed
+	 * interrupt, asynchronously and unconditionally, right here -- before
+	 * the chip's backplane clock is necessarily stable. That thread's own
+	 * dhdsdio_dpc()-equivalent read is exactly what has timed out
+	 * ("Timeout waiting for hardware interrupt", CMD53, SDIO function 1)
+	 * in every dwell sweep so far. Skip the forced re-check under
+	 * kobowm_light_resume and let an explicit userspace PM_FAST
+	 * afterward (already proven safe standalone) do the real wake
+	 * instead, once the bus has had a moment to settle -- not skipping
+	 * IRQ handling forever, just not forcing it into this exact race
+	 * window. NOTE: this defers real interrupt handling by however long
+	 * it takes userspace to get around to PM_FAST -- if the chip has
+	 * genuinely queued data/events in the meantime with no other trigger
+	 * to re-check, those could sit unhandled/lost. Bounded and recoverable
+	 * in the isolated dwell-test harness (which always sends PM_FAST or
+	 * reboots shortly after); NOT yet verified safe for the real
+	 * suspend/resume flow where userspace timing is less controlled. */
+	if (!err && host->sdio_irqs && !kobowm_light_resume)
 		mmc_signal_sdio_irq(host);
 	mmc_release_host(host);
 

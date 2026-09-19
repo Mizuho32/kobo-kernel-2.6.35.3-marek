@@ -58,7 +58,7 @@ void notrace walk_stackframe(struct stackframe *frame,
 }
 EXPORT_SYMBOL(walk_stackframe);
 
-#ifdef CONFIG_STACKTRACE
+#if 1 /* KoboWM: force-enable, see fs/proc/base.c */
 struct stack_trace_data {
 	struct stack_trace *trace;
 	unsigned int no_sched_functions;
