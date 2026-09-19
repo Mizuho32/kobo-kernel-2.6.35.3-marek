@@ -2812,7 +2812,19 @@ static int kobowm_clock_status_read(char *page, char **start, off_t off,
  * width to 4-bit via mmc_set_bus_width() (also triggers sdhci_set_ios(),
  * so combined with bit0 this is redundant for clock but adds the
  * HOST_CONTROL 4BITBUS fix trackL-07 never tried). Both use the card's
- * existing ios/CCCR state, no CMD52 renegotiation with the card. */
+ * existing ios/CCCR state, no CMD52 renegotiation with the card.
+ *
+ * bit2 (0x4) = use SDHCI_RESET_CMD|SDHCI_RESET_DATA instead of
+ * sdhci_init()'s SDHCI_RESET_ALL entirely (overrides the plain
+ * sdhci_init() call below). Confirmed by reading sdhci_reset(): the
+ * host->clock=0 bookkeeping only happens for SDHCI_RESET_ALL, so this
+ * narrower reset should never disturb the clock at all -- the point is
+ * isolating whether the clock interruption *during* the reset itself
+ * (not any leftover register state after, already ruled out by bit0+1
+ * above) is what's fatal, vs. something else SDHCI_RESET_ALL does that
+ * this narrower reset doesn't. Still runs sdhci_restore_int_regs()
+ * afterward (the interrupt-mask/WML restore, harmless either way) to
+ * mimic what a real resume needs regardless of reset width. */
 static int kobowm_hostinit_test_write(struct file *file, const char *buf,
 				       unsigned long count, void *data)
 {
@@ -2832,9 +2844,16 @@ static int kobowm_hostinit_test_write(struct file *file, const char *buf,
 		mode = simple_strtoul(kbuf, NULL, 10);
 	}
 
-	printk(KERN_ERR "[KoboWM-hostinit-test] sdhci_init() (mode=0x%lx)\n",
-	       mode);
-	sdhci_init(chip->hosts[0]);
+	if (mode & 0x4) {
+		printk(KERN_ERR "[KoboWM-hostinit-test] sdhci_reset(CMD|DATA)"
+		       " instead of ALL (mode=0x%lx)\n", mode);
+		sdhci_reset(chip->hosts[0], SDHCI_RESET_CMD | SDHCI_RESET_DATA);
+		sdhci_restore_int_regs(chip->hosts[0]);
+	} else {
+		printk(KERN_ERR "[KoboWM-hostinit-test] sdhci_init() "
+		       "(mode=0x%lx)\n", mode);
+		sdhci_init(chip->hosts[0]);
+	}
 
 	if (mode & 0x1) {
 		printk(KERN_ERR "[KoboWM-hostinit-test] restoring clock "
