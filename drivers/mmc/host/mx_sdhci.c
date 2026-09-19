@@ -2760,7 +2760,7 @@ static int kobowm_clock_status_read(char *page, char **start, off_t off,
 				     int count, int *eof, void *data)
 {
 	struct sdhci_chip *chip = mxc_fix_chips[2];
-	u32 clk_ctrl, host_ctrl, present_state;
+	u32 clk_ctrl, host_ctrl, power_ctrl, present_state;
 	int len;
 
 	if (!chip || !chip->hosts[0]) {
@@ -2771,6 +2771,22 @@ static int kobowm_clock_status_read(char *page, char **start, off_t off,
 
 	clk_ctrl = readl(chip->hosts[0]->ioaddr + SDHCI_CLOCK_CONTROL);
 	host_ctrl = readl(chip->hosts[0]->ioaddr + SDHCI_HOST_CONTROL);
+	/* KoboWM Track L 9 (user hunch): sdhci_reset() and the
+	 * INT_ENABLE/SIGNAL_ENABLE/WML restore that follows it never touch
+	 * SDHCI_POWER_CONTROL at all -- but SDHCI_RESET_ALL is specified to
+	 * reset the "entire Host Controller", which per spec typically
+	 * includes Power Control resetting to its POR default (SD Bus
+	 * Power off). Nothing in this driver's resume/init path re-asserts
+	 * it afterward. The WiFi chip's own VDD rail stays up regardless
+	 * (Phase 1's GPIO fix, entirely separate from this register), but
+	 * if the HOST's own internal logic gates transactions on this bit
+	 * reading "bus power off", that would explain persistent failure
+	 * despite the card being electrically fine. */
+	/* SDHCI_POWER_CONTROL (0x29) isn't 4-byte aligned; read the aligned
+	 * 4-byte group starting at SDHCI_HOST_CONTROL (0x28) like the rest
+	 * of this driver does, and extract the POWER_CONTROL byte (offset
+	 * +1) from it instead of an unaligned readb(). */
+	power_ctrl = (host_ctrl >> 8) & 0xff;
 	present_state = readl(chip->hosts[0]->ioaddr + SDHCI_PRESENT_STATE);
 
 	len = snprintf(page, count,
@@ -2784,6 +2800,9 @@ static int kobowm_clock_status_read(char *page, char **start, off_t off,
 		       "  4BITBUS (bus width 4-bit)     = %d\n"
 		       "  HISPD   (high speed mode)     = %d\n"
 		       "  ADMA    (ADMA enabled)        = %d\n"
+		       "SDHCI_POWER_CONTROL    = 0x%02x\n"
+		       "  POWER_ON (SD bus power)       = %d\n"
+		       "  voltage select bits            = 0x%x\n"
 		       "SDHCI_PRESENT_STATE    = 0x%08x\n",
 		       chip->hosts[0]->clock,
 		       clk_ctrl,
@@ -2795,6 +2814,9 @@ static int kobowm_clock_status_read(char *page, char **start, off_t off,
 		       !!(host_ctrl & SDHCI_CTRL_4BITBUS),
 		       !!(host_ctrl & SDHCI_CTRL_HISPD),
 		       !!(host_ctrl & SDHCI_CTRL_ADMA),
+		       power_ctrl,
+		       !!(power_ctrl & SDHCI_POWER_ON),
+		       (power_ctrl & 0x0e),
 		       present_state);
 	*eof = 1;
 	return len;
