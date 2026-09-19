@@ -248,11 +248,14 @@ static void sdhci_reset(struct sdhci_host *host, u8 mask)
 	last_op_dir = 0;
 }
 
-static void sdhci_init(struct sdhci_host *host)
+/* KoboWM Track L 8 (mds/wifi-hostsleep/trackL-08-*.md): the interrupt-mask/
+ * WML register restore that sdhci_init() does after its sdhci_reset(ALL),
+ * factored out so sdhci_init_light() below can perform the same restore
+ * WITHOUT ever calling sdhci_reset(SDHCI_RESET_ALL) -- see that function's
+ * comment for why. */
+static void sdhci_restore_int_regs(struct sdhci_host *host)
 {
 	u32 intmask;
-
-	sdhci_reset(host, SDHCI_RESET_ALL);
 
 	intmask = SDHCI_INT_ADMA_ERROR |
 	    SDHCI_INT_DATA_END_BIT | SDHCI_INT_DATA_CRC |
@@ -292,6 +295,31 @@ static void sdhci_init(struct sdhci_host *host)
 	 * prior suspend flow rmmod'd dhd.ko first. See
 	 * mds/wifi-hostsleep/phase5-attempt9-*.md. */
 	writel(intmask | SDHCI_INT_CARD_INT, host->ioaddr + SDHCI_SIGNAL_ENABLE);
+}
+
+static void sdhci_init(struct sdhci_host *host)
+{
+	sdhci_reset(host, SDHCI_RESET_ALL);
+	sdhci_restore_int_regs(host);
+}
+
+/* KoboWM Track L 8 (mds/wifi-hostsleep/trackL-08-*.md): a resume-time
+ * host-controller re-init that never calls sdhci_reset(SDHCI_RESET_ALL).
+ * trackL-07 established that ANY call to sdhci_reset(ALL) -- even on a
+ * fully live, never-suspended system -- reliably kills the WiFi SDIO
+ * function's data path (carrier stays UP, ping fails), and that restoring
+ * the clock immediately afterward does NOT help. SDHCI_RESET_ALL exists to
+ * recover the HOST CONTROLLER's own register state after ITS power/clock
+ * domain was lost -- a concern that's orthogonal to whether the SD card
+ * itself is still present (card-detect is handled separately via
+ * esdhc_cd_callback/detect_irq, not via this reset). This function skips
+ * that reset and only restores the interrupt-mask/WML registers
+ * sdhci_init() normally restores -- safe to write unconditionally
+ * regardless of whether they were actually lost, and touches nothing
+ * clock-related. */
+static void sdhci_init_light(struct sdhci_host *host)
+{
+	sdhci_restore_int_regs(host);
 }
 
 static void sdhci_activate_led(struct sdhci_host *host)
@@ -1910,6 +1938,12 @@ static int sdhci_suspend(struct platform_device *pdev, pm_message_t state)
 	return 0;
 }
 
+/* KoboWM Track L 8 (mds/wifi-hostsleep/trackL-08-*.md): tentative
+ * declaration -- the real definition (with proc-toggle plumbing) lives
+ * much further down in this file, near kobowm_light_resume, but
+ * sdhci_resume() below needs to see it first. */
+static int kobowm_light_hostinit;
+
 static int sdhci_resume(struct platform_device *pdev)
 {
 	struct sdhci_chip *chip;
@@ -1955,7 +1989,27 @@ static int sdhci_resume(struct platform_device *pdev)
 				  chip->hosts[i]);
 		if (ret)
 			return ret;
-		sdhci_init(chip->hosts[i]);
+		/* Track L 8 (mds/wifi-hostsleep/trackL-08-*.md): for the
+		 * WiFi slot specifically (pdev->id==2), when the card
+		 * negotiated MMC_PM_KEEP_POWER on suspend (i.e. it was never
+		 * actually powered off -- exactly the host-sleep case this
+		 * whole project is about) and the toggle is enabled, skip
+		 * the full sdhci_reset(SDHCI_RESET_ALL) that trackL-07
+		 * confirmed reliably kills the WiFi SDIO data path, and only
+		 * restore the interrupt-mask/WML registers instead. Scoped
+		 * narrowly: internal storage (id!=2) and external SD (id==1,
+		 * already special-cased above, and genuinely removable/
+		 * power-loss-prone unlike the soldered-down WiFi module)
+		 * always get the real full reset, unchanged. */
+		if (pdev->id == 2 && kobowm_light_hostinit &&
+		    (chip->hosts[i]->mmc->pm_flags & MMC_PM_KEEP_POWER)) {
+			printk(KERN_ERR "[KoboWM-light-hostinit] resume: "
+			       "sdhci_init_light() for WiFi slot (no full "
+			       "reset)\n");
+			sdhci_init_light(chip->hosts[i]);
+		} else {
+			sdhci_init(chip->hosts[i]);
+		}
 		chip->hosts[i]->init_flag = 2;
 		mmiowb();
 		ret = mmc_resume_host(chip->hosts[i]->mmc);
@@ -2647,6 +2701,38 @@ static int kobowm_light_resume_read(char *page, char **start, off_t off,
 	return len;
 }
 
+/* KoboWM Track L 8 (mds/wifi-hostsleep/trackL-08-*.md): toggle selecting
+ * sdhci_init_light() (skip sdhci_reset(SDHCI_RESET_ALL) entirely) instead
+ * of sdhci_init() in the real sdhci_resume() path. Default off so normal
+ * boot/resume behavior is unaffected unless explicitly enabled via
+ * `echo 1 > /proc/kobowm_light_hostinit`. Same pattern as
+ * kobowm_light_resume above. */
+static int kobowm_light_hostinit = 0;
+
+static int kobowm_light_hostinit_write(struct file *file, const char *buf,
+					unsigned long count, void *data)
+{
+	char kbuf[8];
+	unsigned long n = count < sizeof(kbuf) - 1 ? count : sizeof(kbuf) - 1;
+
+	if (copy_from_user(kbuf, buf, n))
+		return -EFAULT;
+	kbuf[n] = '\0';
+
+	kobowm_light_hostinit = simple_strtoul(kbuf, NULL, 10) ? 1 : 0;
+	printk(KERN_ERR "[KoboWM-light-hostinit] kobowm_light_hostinit=%d\n",
+	       kobowm_light_hostinit);
+	return count;
+}
+
+static int kobowm_light_hostinit_read(char *page, char **start, off_t off,
+				       int count, int *eof, void *data)
+{
+	int len = snprintf(page, count, "%d\n", kobowm_light_hostinit);
+	*eof = 1;
+	return len;
+}
+
 /* KoboWM Track L (mds/wifi-hostsleep/trackL-05-*.md): claim-and-hold pair.
  * mmc_claim_host()/mmc_release_host() (drivers/mmc/core/core.c) is a
  * recursive-per-task mutex (host->claimer == current, host->claim_cnt
@@ -2850,6 +2936,14 @@ static int __init sdhci_drv_init(void)
 		printk(KERN_ERR "[KoboWM-light-resume] failed to create "
 		       "/proc/kobowm_light_resume\n");
 
+	pe = create_proc_entry("kobowm_light_hostinit", 0644, NULL);
+	if (pe) {
+		pe->write_proc = kobowm_light_hostinit_write;
+		pe->read_proc = kobowm_light_hostinit_read;
+	} else
+		printk(KERN_ERR "[KoboWM-light-hostinit] failed to create "
+		       "/proc/kobowm_light_hostinit\n");
+
 	pe = create_proc_entry("kobowm_mmc_claim", 0200, NULL);
 	if (pe)
 		pe->write_proc = kobowm_mmc_claim_write;
@@ -2875,6 +2969,7 @@ static void __exit sdhci_drv_exit(void)
 	remove_proc_entry("kobowm_mmc_liveness", NULL);
 	remove_proc_entry("kobowm_mmc_rescan", NULL);
 	remove_proc_entry("kobowm_light_resume", NULL);
+	remove_proc_entry("kobowm_light_hostinit", NULL);
 	remove_proc_entry("kobowm_mmc_claim", NULL);
 	remove_proc_entry("kobowm_mmc_release", NULL);
 	platform_driver_unregister(&sdhci_driver);
