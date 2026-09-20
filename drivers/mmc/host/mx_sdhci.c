@@ -2948,6 +2948,35 @@ static int kobowm_hostinit_test_write(struct file *file, const char *buf,
 			udelay(20);
 		}
 
+		if (mode & 0x40) {
+			/* KoboWM Track L 9 addendum: mode=0x10 alone fixed the
+			 * immediate catastrophic bus-width-mismatch failure,
+			 * but a slower degradation (progressively rising
+			 * ping loss over repeated trials) remained, tracing
+			 * back to the clock auto-gate-disable bits (PER_EN/
+			 * HLK_EN/IPG_EN) still reading 0 after the ALL reset
+			 * -- matching the NXP community report that some
+			 * SDIO cards need the clock NOT auto-gated to
+			 * reliably signal card interrupts. Apply the SAME
+			 * "restore immediately, before any other register
+			 * write" timing that fixed bus width, this time to
+			 * the auto-gate bits: read the CURRENT (post-reset)
+			 * CLOCK_CONTROL value and OR the three disable bits
+			 * back in, right here -- before HOST_CONTROL restore
+			 * and before WML/INT_ENABLE/SIGNAL_ENABLE. SD_EN is
+			 * deliberately left alone (already reads 1 after
+			 * ALL reset, confirmed by trackL-09's diagnostics --
+			 * no need to force it). */
+			u32 clk_now = readl(chip->hosts[0]->ioaddr +
+					     SDHCI_CLOCK_CONTROL);
+			printk(KERN_ERR "[KoboWM-hostinit-test] restoring "
+			       "clock auto-gate-disable bits immediately "
+			       "(clk_now=0x%08x)\n", clk_now);
+			writel(clk_now | SDHCI_CLOCK_PER_EN |
+				       SDHCI_CLOCK_HLK_EN | SDHCI_CLOCK_IPG_EN,
+			       chip->hosts[0]->ioaddr + SDHCI_CLOCK_CONTROL);
+		}
+
 		/* non-ALL branch's post-reset restore, done unconditionally
 		 * here (real code gates this on !(mask & ALL)). */
 		writel(reg_save_test, chip->hosts[0]->ioaddr +
