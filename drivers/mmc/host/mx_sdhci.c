@@ -303,19 +303,19 @@ static void sdhci_reset(struct sdhci_host *host, u8 mask)
 			       SDHCI_CLOCK_IPG_EN,
 		       host->ioaddr + SDHCI_CLOCK_CONTROL);
 		/* KoboWM Track L 9 (mds/wifi-hostsleep/trackL-09-*.md,
-		 * "追記5"): a real (cold) suspend/resume -- clock/power
-		 * domain genuinely lost and restored, unlike every prior
-		 * pseudo-test via /proc/kobowm_hostinit_test on a live,
-		 * already-clocked system -- hung on the very next register
-		 * write (sdhci_restore_int_regs()'s SDHCI_WML write) right
-		 * after this clock auto-gate-disable bit write, even though
-		 * this same write sequence had run cleanly dozens of times
-		 * in pseudo-testing. Give the clock domain a moment to
-		 * settle before any further register access; value is a
-		 * guess (no datasheet timing spec at hand), chosen to be
-		 * generous relative to the SD clock's period while still
+		 * "追記5"/"追記7"/"追記8"): a real (cold) suspend/resume --
+		 * clock/power domain genuinely lost and restored, unlike
+		 * every prior pseudo-test via /proc/kobowm_hostinit_test on
+		 * a live, already-clocked system -- hard-hangs on the very
+		 * next register write (sdhci_restore_int_regs()'s SDHCI_WML
+		 * write) right after this clock auto-gate-disable bit write.
+		 * udelay(100) here was confirmed INTERMITTENT on real
+		 * hardware (2 hard hangs out of 3 real-suspend trials, exact
+		 * same checkpoint each time) -- not enough margin, not a
+		 * fix. Raised by 20x as the next candidate; still just a
+		 * guess (no datasheet timing spec at hand) chosen to be
 		 * cheap next to the reset poll's own up-to-100ms budget. */
-		udelay(100);
+		mdelay(2);
 		writel(reg_save, host->ioaddr + SDHCI_HOST_CONTROL);
 	} else if (host->flags & SDHCI_CD_PRESENT) {
 		/*
