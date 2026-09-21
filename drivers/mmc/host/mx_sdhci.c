@@ -223,6 +223,9 @@ static void sdhci_reset(struct sdhci_host *host, u8 mask)
 	if ((mask & SDHCI_RESET_ALL) || (host->flags & SDHCI_CD_PRESENT))
 		reg_save = readl(host->ioaddr + SDHCI_HOST_CONTROL);
 
+	printk(KERN_ERR "[KoboWM-L9dbg] sdhci_reset(%s, mask=0x%x): "
+	       "pre-trigger\n", mmc_hostname(host->mmc), (int)mask);
+
 	tmp = readl(host->ioaddr + SDHCI_CLOCK_CONTROL) | (mask << 24);
 	mask_u32 = readl(host->ioaddr + SDHCI_SIGNAL_ENABLE);
 	writel(tmp, host->ioaddr + SDHCI_CLOCK_CONTROL);
@@ -242,6 +245,9 @@ static void sdhci_reset(struct sdhci_host *host, u8 mask)
 		udelay(20);
 	}
 
+	printk(KERN_ERR "[KoboWM-L9dbg] sdhci_reset(%s, mask=0x%x): "
+	       "poll done, pre-restore\n", mmc_hostname(host->mmc), (int)mask);
+
 	if (mask & SDHCI_RESET_ALL) {
 		/* restore clock auto-gate-disable bits immediately, before
 		 * anything else -- see comment above. SD_EN and the clock
@@ -259,6 +265,9 @@ static void sdhci_reset(struct sdhci_host *host, u8 mask)
 		 */
 		writel(reg_save, host->ioaddr + SDHCI_HOST_CONTROL);
 	}
+	printk(KERN_ERR "[KoboWM-L9dbg] sdhci_reset(%s, mask=0x%x): "
+	       "restore done, pre-WML/INT/SIGNAL\n", mmc_hostname(host->mmc),
+	       (int)mask);
 	if (host->flags & SDHCI_USE_DMA)
 		mask_u32 &= ~(SDHCI_INT_DATA_AVAIL | SDHCI_INT_SPACE_AVAIL);
 	if (mxc_wml_value == 512)
@@ -268,6 +277,8 @@ static void sdhci_reset(struct sdhci_host *host, u8 mask)
 	writel(mask_u32 | SDHCI_INT_CARD_INT, host->ioaddr + SDHCI_INT_ENABLE);
 	writel(mask_u32, host->ioaddr + SDHCI_SIGNAL_ENABLE);
 	last_op_dir = 0;
+	printk(KERN_ERR "[KoboWM-L9dbg] sdhci_reset(%s, mask=0x%x): EXIT\n",
+	       mmc_hostname(host->mmc), (int)mask);
 }
 
 /* KoboWM Track L 8 (mds/wifi-hostsleep/trackL-08-*.md): the interrupt-mask/
@@ -321,8 +332,14 @@ static void sdhci_restore_int_regs(struct sdhci_host *host)
 
 static void sdhci_init(struct sdhci_host *host)
 {
+	printk(KERN_ERR "[KoboWM-L9dbg] sdhci_init(%s): pre sdhci_reset(ALL)\n",
+	       mmc_hostname(host->mmc));
 	sdhci_reset(host, SDHCI_RESET_ALL);
+	printk(KERN_ERR "[KoboWM-L9dbg] sdhci_init(%s): post sdhci_reset(ALL), "
+	       "pre sdhci_restore_int_regs\n", mmc_hostname(host->mmc));
 	sdhci_restore_int_regs(host);
+	printk(KERN_ERR "[KoboWM-L9dbg] sdhci_init(%s): EXIT\n",
+	       mmc_hostname(host->mmc));
 }
 
 /* KoboWM Track L 8 (mds/wifi-hostsleep/trackL-08-*.md): a resume-time
@@ -1907,6 +1924,9 @@ static int sdhci_suspend(struct platform_device *pdev, pm_message_t state)
 	if (!chip)
 		return 0;
 
+	printk(KERN_ERR "[KoboWM-L9dbg] sdhci_suspend ENTER pdev->id=%d\n",
+	       pdev->id);
+
 	DBG("Suspending...\n");
 	iHWID = check_hardware_name();
 
@@ -1943,13 +1963,20 @@ static int sdhci_suspend(struct platform_device *pdev, pm_message_t state)
 	for (i = 0; i < chip->num_slots; i++) {
 		if (!chip->hosts[i])
 			continue;
+		printk(KERN_ERR "[KoboWM-L9dbg] suspend: slot i=%d id=%d "
+		       "pre mmc_suspend_host()\n", i, pdev->id);
 		ret = mmc_suspend_host(chip->hosts[i]->mmc);
+		printk(KERN_ERR "[KoboWM-L9dbg] suspend: slot i=%d id=%d "
+		       "mmc_suspend_host() returned %d\n", i, pdev->id, ret);
 		if (ret) {
 			for (i--; i >= 0; i--)
 				mmc_resume_host(chip->hosts[i]->mmc);
 			return ret;
 		}
 	}
+
+	printk(KERN_ERR "[KoboWM-L9dbg] sdhci_suspend EXIT pdev->id=%d\n",
+	       pdev->id);
 
 	for (i = 0; i < chip->num_slots; i++) {
 		if (!chip->hosts[i])
@@ -1976,6 +2003,9 @@ static int sdhci_resume(struct platform_device *pdev)
 	chip = dev_get_drvdata(&pdev->dev);
 	if (!chip)
 		return 0;
+
+	printk(KERN_ERR "[KoboWM-L9dbg] sdhci_resume ENTER pdev->id=%d\n",
+	       pdev->id);
 
 	DBG("Resuming...\n");
 	iHWID = check_hardware_name();
@@ -2023,6 +2053,8 @@ static int sdhci_resume(struct platform_device *pdev)
 		 * already special-cased above, and genuinely removable/
 		 * power-loss-prone unlike the soldered-down WiFi module)
 		 * always get the real full reset, unchanged. */
+		printk(KERN_ERR "[KoboWM-L9dbg] resume: slot i=%d id=%d "
+		       "about to re-init host controller\n", i, pdev->id);
 		if (pdev->id == 2 && kobowm_light_hostinit &&
 		    (chip->hosts[i]->mmc->pm_flags & MMC_PM_KEEP_POWER)) {
 			printk(KERN_ERR "[KoboWM-light-hostinit] resume: "
@@ -2032,13 +2064,20 @@ static int sdhci_resume(struct platform_device *pdev)
 		} else {
 			sdhci_init(chip->hosts[i]);
 		}
+		printk(KERN_ERR "[KoboWM-L9dbg] resume: slot i=%d id=%d "
+		       "host controller re-init returned, calling "
+		       "mmc_resume_host()\n", i, pdev->id);
 		chip->hosts[i]->init_flag = 2;
 		mmiowb();
 		ret = mmc_resume_host(chip->hosts[i]->mmc);
+		printk(KERN_ERR "[KoboWM-L9dbg] resume: slot i=%d id=%d "
+		       "mmc_resume_host() returned %d\n", i, pdev->id, ret);
 		if (ret)
 			return ret;
 	}
 
+	printk(KERN_ERR "[KoboWM-L9dbg] sdhci_resume EXIT pdev->id=%d\n",
+	       pdev->id);
 	return 0;
 }
 
