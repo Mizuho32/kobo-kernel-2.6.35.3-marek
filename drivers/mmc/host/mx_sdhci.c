@@ -49,6 +49,7 @@
 #include <mach/dma.h>
 #include <mach/mmc.h>
 #include <mach/common.h>
+#include <mach/mxc_uart.h>
 
 #include "mx_sdhci.h"
 
@@ -196,6 +197,46 @@ static void sdhci_dumpregs(struct sdhci_host *host)
  *                                                                           *
 \*****************************************************************************/
 
+/* KoboWM Track L 9 (mds/wifi-hostsleep/trackL-09-*.md): a real-suspend
+ * (`echo mem > /sys/power/state`) hard hang produced ZERO printk output
+ * anywhere between the command and the hang, even with markers bracketing
+ * sdhci_suspend()/sdhci_resume()/sdhci_reset() -- meaning the Linux console
+ * subsystem itself stays suspended for the entire window and ordinary
+ * printk() is useless here. This pokes UART2 (ttymxc0 on MACH_TYPE_MX50_RDP,
+ * confirmed via arch/arm/plat-mxc/include/mach/uncompress.h's decompressor-
+ * stage console setup) directly via its TXR/USR2/UCR1 registers, bypassing
+ * the console layer entirely -- the same technique the kernel's own
+ * decompressor uses before the console subsystem exists. Only produces
+ * output if the UART peripheral itself still has clock+power at the call
+ * site; silence here (unlike with printk) means the peripheral's own clock
+ * is gone by that point, not just the console layer being asleep. */
+static void kobowm_raw_uart_puts(const char *s)
+{
+	void __iomem *uart = IO_ADDRESS(UART2_BASE_ADDR);
+	unsigned long timeout;
+
+	if (!(readl(uart + MXC_UARTUCR1) & MXC_UARTUCR1_UARTEN))
+		return;
+
+	for (; *s; s++) {
+		timeout = 1000000;
+		while (!(readl(uart + MXC_UARTUSR2) & MXC_UARTUSR2_TXFE)) {
+			if (--timeout == 0)
+				return;
+		}
+		if (*s == '\n') {
+			writel('\r', uart + MXC_UARTUTXD);
+			timeout = 1000000;
+			while (!(readl(uart + MXC_UARTUSR2) &
+				 MXC_UARTUSR2_TXFE)) {
+				if (--timeout == 0)
+					return;
+			}
+		}
+		writel((unsigned char)*s, uart + MXC_UARTUTXD);
+	}
+}
+
 static void sdhci_reset(struct sdhci_host *host, u8 mask)
 {
 	unsigned long tmp;
@@ -225,6 +266,8 @@ static void sdhci_reset(struct sdhci_host *host, u8 mask)
 
 	printk(KERN_ERR "[KoboWM-L9dbg] sdhci_reset(%s, mask=0x%x): "
 	       "pre-trigger\n", mmc_hostname(host->mmc), (int)mask);
+	if (mask & SDHCI_RESET_ALL)
+		kobowm_raw_uart_puts("[L9raw] reset:pre-trigger\n");
 
 	tmp = readl(host->ioaddr + SDHCI_CLOCK_CONTROL) | (mask << 24);
 	mask_u32 = readl(host->ioaddr + SDHCI_SIGNAL_ENABLE);
@@ -247,6 +290,8 @@ static void sdhci_reset(struct sdhci_host *host, u8 mask)
 
 	printk(KERN_ERR "[KoboWM-L9dbg] sdhci_reset(%s, mask=0x%x): "
 	       "poll done, pre-restore\n", mmc_hostname(host->mmc), (int)mask);
+	if (mask & SDHCI_RESET_ALL)
+		kobowm_raw_uart_puts("[L9raw] reset:poll-done\n");
 
 	if (mask & SDHCI_RESET_ALL) {
 		/* restore clock auto-gate-disable bits immediately, before
@@ -268,6 +313,8 @@ static void sdhci_reset(struct sdhci_host *host, u8 mask)
 	printk(KERN_ERR "[KoboWM-L9dbg] sdhci_reset(%s, mask=0x%x): "
 	       "restore done, pre-WML/INT/SIGNAL\n", mmc_hostname(host->mmc),
 	       (int)mask);
+	if (mask & SDHCI_RESET_ALL)
+		kobowm_raw_uart_puts("[L9raw] reset:restore-done\n");
 	if (host->flags & SDHCI_USE_DMA)
 		mask_u32 &= ~(SDHCI_INT_DATA_AVAIL | SDHCI_INT_SPACE_AVAIL);
 	if (mxc_wml_value == 512)
@@ -279,6 +326,8 @@ static void sdhci_reset(struct sdhci_host *host, u8 mask)
 	last_op_dir = 0;
 	printk(KERN_ERR "[KoboWM-L9dbg] sdhci_reset(%s, mask=0x%x): EXIT\n",
 	       mmc_hostname(host->mmc), (int)mask);
+	if (mask & SDHCI_RESET_ALL)
+		kobowm_raw_uart_puts("[L9raw] reset:EXIT\n");
 }
 
 /* KoboWM Track L 8 (mds/wifi-hostsleep/trackL-08-*.md): the interrupt-mask/
@@ -334,12 +383,15 @@ static void sdhci_init(struct sdhci_host *host)
 {
 	printk(KERN_ERR "[KoboWM-L9dbg] sdhci_init(%s): pre sdhci_reset(ALL)\n",
 	       mmc_hostname(host->mmc));
+	kobowm_raw_uart_puts("[L9raw] init:pre-reset\n");
 	sdhci_reset(host, SDHCI_RESET_ALL);
 	printk(KERN_ERR "[KoboWM-L9dbg] sdhci_init(%s): post sdhci_reset(ALL), "
 	       "pre sdhci_restore_int_regs\n", mmc_hostname(host->mmc));
+	kobowm_raw_uart_puts("[L9raw] init:post-reset\n");
 	sdhci_restore_int_regs(host);
 	printk(KERN_ERR "[KoboWM-L9dbg] sdhci_init(%s): EXIT\n",
 	       mmc_hostname(host->mmc));
+	kobowm_raw_uart_puts("[L9raw] init:EXIT\n");
 }
 
 /* KoboWM Track L 8 (mds/wifi-hostsleep/trackL-08-*.md): a resume-time
@@ -1926,6 +1978,8 @@ static int sdhci_suspend(struct platform_device *pdev, pm_message_t state)
 
 	printk(KERN_ERR "[KoboWM-L9dbg] sdhci_suspend ENTER pdev->id=%d\n",
 	       pdev->id);
+	if (2 == pdev->id)
+		kobowm_raw_uart_puts("[L9raw] suspend:ENTER id=2\n");
 
 	DBG("Suspending...\n");
 	iHWID = check_hardware_name();
@@ -1965,9 +2019,13 @@ static int sdhci_suspend(struct platform_device *pdev, pm_message_t state)
 			continue;
 		printk(KERN_ERR "[KoboWM-L9dbg] suspend: slot i=%d id=%d "
 		       "pre mmc_suspend_host()\n", i, pdev->id);
+		if (2 == pdev->id)
+			kobowm_raw_uart_puts("[L9raw] suspend:pre mmc_suspend_host\n");
 		ret = mmc_suspend_host(chip->hosts[i]->mmc);
 		printk(KERN_ERR "[KoboWM-L9dbg] suspend: slot i=%d id=%d "
 		       "mmc_suspend_host() returned %d\n", i, pdev->id, ret);
+		if (2 == pdev->id)
+			kobowm_raw_uart_puts("[L9raw] suspend:post mmc_suspend_host\n");
 		if (ret) {
 			for (i--; i >= 0; i--)
 				mmc_resume_host(chip->hosts[i]->mmc);
@@ -1977,6 +2035,8 @@ static int sdhci_suspend(struct platform_device *pdev, pm_message_t state)
 
 	printk(KERN_ERR "[KoboWM-L9dbg] sdhci_suspend EXIT pdev->id=%d\n",
 	       pdev->id);
+	if (2 == pdev->id)
+		kobowm_raw_uart_puts("[L9raw] suspend:EXIT id=2\n");
 
 	for (i = 0; i < chip->num_slots; i++) {
 		if (!chip->hosts[i])
@@ -2006,6 +2066,8 @@ static int sdhci_resume(struct platform_device *pdev)
 
 	printk(KERN_ERR "[KoboWM-L9dbg] sdhci_resume ENTER pdev->id=%d\n",
 	       pdev->id);
+	if (2 == pdev->id)
+		kobowm_raw_uart_puts("[L9raw] resume:ENTER id=2\n");
 
 	DBG("Resuming...\n");
 	iHWID = check_hardware_name();
@@ -2055,6 +2117,8 @@ static int sdhci_resume(struct platform_device *pdev)
 		 * always get the real full reset, unchanged. */
 		printk(KERN_ERR "[KoboWM-L9dbg] resume: slot i=%d id=%d "
 		       "about to re-init host controller\n", i, pdev->id);
+		if (2 == pdev->id)
+			kobowm_raw_uart_puts("[L9raw] resume:pre host-reinit\n");
 		if (pdev->id == 2 && kobowm_light_hostinit &&
 		    (chip->hosts[i]->mmc->pm_flags & MMC_PM_KEEP_POWER)) {
 			printk(KERN_ERR "[KoboWM-light-hostinit] resume: "
@@ -2067,17 +2131,24 @@ static int sdhci_resume(struct platform_device *pdev)
 		printk(KERN_ERR "[KoboWM-L9dbg] resume: slot i=%d id=%d "
 		       "host controller re-init returned, calling "
 		       "mmc_resume_host()\n", i, pdev->id);
+		if (2 == pdev->id)
+			kobowm_raw_uart_puts("[L9raw] resume:post host-reinit, "
+					      "pre mmc_resume_host\n");
 		chip->hosts[i]->init_flag = 2;
 		mmiowb();
 		ret = mmc_resume_host(chip->hosts[i]->mmc);
 		printk(KERN_ERR "[KoboWM-L9dbg] resume: slot i=%d id=%d "
 		       "mmc_resume_host() returned %d\n", i, pdev->id, ret);
+		if (2 == pdev->id)
+			kobowm_raw_uart_puts("[L9raw] resume:post mmc_resume_host\n");
 		if (ret)
 			return ret;
 	}
 
 	printk(KERN_ERR "[KoboWM-L9dbg] sdhci_resume EXIT pdev->id=%d\n",
 	       pdev->id);
+	if (2 == pdev->id)
+		kobowm_raw_uart_puts("[L9raw] resume:EXIT id=2\n");
 	return 0;
 }
 
