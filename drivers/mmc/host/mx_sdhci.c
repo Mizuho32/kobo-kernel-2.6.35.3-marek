@@ -208,9 +208,19 @@ static void sdhci_reset(struct sdhci_host *host, u8 mask)
 			return;
 	}
 
+	/* KoboWM Track L 9 (mds/wifi-hostsleep/trackL-09-*.md) BREAKTHROUGH:
+	 * SDHCI_RESET_ALL's own hw reset clears HOST_CONTROL (bus width) and
+	 * the clock auto-gate-disable bits (PER_EN/HLK_EN/IPG_EN), which
+	 * breaks the onboard WiFi SDIO chip. Restoring them LATER -- e.g.
+	 * after sdhci_init() fully returns -- does NOT prevent the breakage;
+	 * validated (repeated clean chip-power-cycle trials) that only
+	 * restoring them HERE, immediately after the hw reset completes and
+	 * before any other register write (WML/INT_ENABLE/SIGNAL_ENABLE),
+	 * works. So SDHCI_RESET_ALL now also saves HOST_CONTROL before the
+	 * trigger, same as the non-ALL branch already did. */
 	if (mask & SDHCI_RESET_ALL)
 		host->clock = 0;
-	else if (host->flags & SDHCI_CD_PRESENT)
+	if ((mask & SDHCI_RESET_ALL) || (host->flags & SDHCI_CD_PRESENT))
 		reg_save = readl(host->ioaddr + SDHCI_HOST_CONTROL);
 
 	tmp = readl(host->ioaddr + SDHCI_CLOCK_CONTROL) | (mask << 24);
@@ -231,12 +241,24 @@ static void sdhci_reset(struct sdhci_host *host, u8 mask)
 		tmp--;
 		udelay(20);
 	}
-	/*
-	 * The INT_EN SIG_EN regs have been modified after reset.
-	 * re-configure them ag.
-	 */
-	if (!(mask & SDHCI_RESET_ALL) && (host->flags & SDHCI_CD_PRESENT))
+
+	if (mask & SDHCI_RESET_ALL) {
+		/* restore clock auto-gate-disable bits immediately, before
+		 * anything else -- see comment above. SD_EN and the clock
+		 * divider bits are deliberately left alone (already read
+		 * back correctly after the reset). */
+		u32 clk_now = readl(host->ioaddr + SDHCI_CLOCK_CONTROL);
+		writel(clk_now | SDHCI_CLOCK_PER_EN | SDHCI_CLOCK_HLK_EN |
+			       SDHCI_CLOCK_IPG_EN,
+		       host->ioaddr + SDHCI_CLOCK_CONTROL);
 		writel(reg_save, host->ioaddr + SDHCI_HOST_CONTROL);
+	} else if (host->flags & SDHCI_CD_PRESENT) {
+		/*
+		 * The INT_EN SIG_EN regs have been modified after reset.
+		 * re-configure them ag.
+		 */
+		writel(reg_save, host->ioaddr + SDHCI_HOST_CONTROL);
+	}
 	if (host->flags & SDHCI_USE_DMA)
 		mask_u32 &= ~(SDHCI_INT_DATA_AVAIL | SDHCI_INT_SPACE_AVAIL);
 	if (mxc_wml_value == 512)
