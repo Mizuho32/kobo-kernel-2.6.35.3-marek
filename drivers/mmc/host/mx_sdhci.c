@@ -396,7 +396,33 @@ static void sdhci_restore_int_regs(struct sdhci_host *host)
 	 * where an MMC_CAP_SDIO_IRQ consumer (dhd.ko) stays loaded across a
 	 * real suspend/resume that reaches this code path at all -- every
 	 * prior suspend flow rmmod'd dhd.ko first. See
-	 * mds/wifi-hostsleep/phase5-attempt9-*.md. */
+	 * mds/wifi-hostsleep/phase5-attempt9-*.md.
+	 *
+	 * KoboWM Track L 9 (mds/wifi-hostsleep/trackL-09-*.md, "追記9"): a
+	 * real suspend/resume hard-hangs at exactly this writel(), pinpointed
+	 * via per-register raw UART markers (WML and INT_ENABLE, immediately
+	 * above, complete fine every time). This SIGNAL_ENABLE write is what
+	 * actually unmasks SDHCI_INT_CARD_INT to the CPU; if the WiFi chip's
+	 * SDIO interrupt line (CCCR INTx) is still asserted from before the
+	 * reset -- consistent with a "Got data interrupt even though no data
+	 * operation was in progress" warning seen after a different real
+	 * resume this same session -- unmasking it here re-triggers
+	 * immediately, and sdhci_irq() trying to take a lock this resuming
+	 * thread already holds is a plausible self-deadlock (matching
+	 * mds/dhd-oob-irq-investigation.md's much older ksdioirqd-stuck-in-
+	 * mmc_wait_for_req() finding). sdhci_enable_sdio_irq() below already
+	 * has the fix for exactly this scenario -- checking
+	 * SDHCI_PRESENT_STATE's CARD_INT bits for a non-idle (i.e. possibly
+	 * latched/stale) condition and clearing SDHCI_INT_STATUS's
+	 * SDHCI_INT_CARD_INT bit before unmasking it -- just never applied
+	 * here. Mirror that same check. */
+	{
+		u32 present = readl(host->ioaddr + SDHCI_PRESENT_STATE);
+		if ((present & SDHCI_CARD_INT_MASK) != SDHCI_CARD_INT_ID)
+			writel(SDHCI_INT_CARD_INT,
+			       host->ioaddr + SDHCI_INT_STATUS);
+	}
+	kobowm_raw_uart_puts("[L9raw] restore_int:post-staleclear,pre-SIGNAL_EN\n");
 	writel(intmask | SDHCI_INT_CARD_INT, host->ioaddr + SDHCI_SIGNAL_ENABLE);
 	kobowm_raw_uart_puts("[L9raw] restore_int:post-SIGNAL_EN,EXIT\n");
 }
