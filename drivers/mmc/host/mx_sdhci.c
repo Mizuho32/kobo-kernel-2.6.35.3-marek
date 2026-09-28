@@ -385,54 +385,37 @@ static void sdhci_restore_int_regs(struct sdhci_host *host)
 	else
 		writel(SDHCI_WML_16_WORDS, host->ioaddr + SDHCI_WML);
 	kobowm_raw_uart_puts("[L9raw] restore_int:post-WML,pre-INT_EN\n");
-	writel(intmask | SDHCI_INT_CARD_INT, host->ioaddr + SDHCI_INT_ENABLE);
+	writel(intmask, host->ioaddr + SDHCI_INT_ENABLE);
 	kobowm_raw_uart_puts("[L9raw] restore_int:post-INT_EN,pre-SIGNAL_EN\n");
-	/* KoboWM host-sleep Phase 2: sdhci_resume() calls sdhci_init() (via
-	 * SDHCI_RESET_ALL) on every resume for every slot, including the WiFi
-	 * slot when dhd.ko stayed loaded/associated across a real suspend
-	 * (mds/wifi-hostsleep/). This SIGNAL_ENABLE write used to omit
-	 * SDHCI_INT_CARD_INT, unlike the INT_ENABLE write two lines up and
-	 * unlike sdhci_enable_sdio_irq() below (which always writes the same
-	 * mask to both registers). INT_ENABLE only lets the status bit latch;
-	 * SIGNAL_ENABLE is what actually asserts the CPU interrupt line, so
-	 * SDIO card interrupts stopped reaching the CPU after any resume that
-	 * runs this path. mmc_sdio_resume() (drivers/mmc/core/sdio.c) never
-	 * re-calls host->ops->enable_sdio_irq() to fix this, and that
-	 * function's own host->sdio_enable refcount doesn't drop to 0 across
-	 * a normal resume either, so nothing else re-asserts the bit. This
-	 * went unnoticed until host-sleep because it's the first scenario
-	 * where an MMC_CAP_SDIO_IRQ consumer (dhd.ko) stays loaded across a
-	 * real suspend/resume that reaches this code path at all -- every
-	 * prior suspend flow rmmod'd dhd.ko first. See
-	 * mds/wifi-hostsleep/phase5-attempt9-*.md.
+	/* KoboWM host-sleep Phase 2: this SIGNAL_ENABLE write used to also
+	 * OR in SDHCI_INT_CARD_INT (unlike upstream, which leaves it out
+	 * here and relies on sdhci_enable_sdio_irq() to assert it), to fix
+	 * SDIO card interrupts not reaching the CPU after a real host-sleep
+	 * resume (mmc_sdio_resume() never re-calls host->ops->
+	 * enable_sdio_irq(), and that function's own host->sdio_enable
+	 * refcount doesn't drop to 0 across a normal resume either, so
+	 * nothing else re-asserts the bit). See mds/wifi-hostsleep/
+	 * phase5-attempt9-*.md.
 	 *
-	 * KoboWM Track L 9 (mds/wifi-hostsleep/trackL-09-*.md, "追記9"): a
-	 * real suspend/resume hard-hangs at exactly this writel(), pinpointed
-	 * via per-register raw UART markers (WML and INT_ENABLE, immediately
-	 * above, complete fine every time). This SIGNAL_ENABLE write is what
-	 * actually unmasks SDHCI_INT_CARD_INT to the CPU; if the WiFi chip's
-	 * SDIO interrupt line (CCCR INTx) is still asserted from before the
-	 * reset -- consistent with a "Got data interrupt even though no data
-	 * operation was in progress" warning seen after a different real
-	 * resume this same session -- unmasking it here re-triggers
-	 * immediately, and sdhci_irq() trying to take a lock this resuming
-	 * thread already holds is a plausible self-deadlock (matching
-	 * mds/dhd-oob-irq-investigation.md's much older ksdioirqd-stuck-in-
-	 * mmc_wait_for_req() finding). sdhci_enable_sdio_irq() below already
-	 * has the fix for exactly this scenario -- checking
-	 * SDHCI_PRESENT_STATE's CARD_INT bits for a non-idle (i.e. possibly
-	 * latched/stale) condition and clearing SDHCI_INT_STATUS's
-	 * SDHCI_INT_CARD_INT bit before unmasking it -- just never applied
-	 * here. Mirror that same check. */
-	{
-		u32 present = readl(host->ioaddr + SDHCI_PRESENT_STATE);
-		if ((present & SDHCI_CARD_INT_MASK) != SDHCI_CARD_INT_ID)
-			writel(SDHCI_INT_CARD_INT,
-			       host->ioaddr + SDHCI_INT_STATUS);
-	}
-	kobowm_raw_uart_puts("[L9raw] restore_int:post-staleclear,pre-SIGNAL_EN\n");
-	irq_marker_budget = 10;
-	writel(intmask | SDHCI_INT_CARD_INT, host->ioaddr + SDHCI_SIGNAL_ENABLE);
+	 * KoboWM Track L 9 (mds/wifi-hostsleep/trackL-09-*.md, "追記9"
+	 * through "追記12"): that fix is what causes a real-suspend hard
+	 * hang/livelock. Per-register raw UART markers + a rate-limited
+	 * sdhci_irq() entry marker proved the writel() itself completes
+	 * fine, but unmasking SDHCI_INT_CARD_INT this early -- immediately
+	 * post-reset, before dhd.ko's ksdioirqd thread is scheduled/ready to
+	 * actually service anything -- lets the WiFi chip's still-asserted
+	 * SDIO interrupt line re-trigger sdhci_irq() continuously (a
+	 * livelock, not a lock-contention deadlock: nothing is blocked,
+	 * sdhci_irq() just keeps re-entering faster than ksdioirqd can ever
+	 * get scheduled to clear the real condition), starving the resuming
+	 * thread of CPU forever. A host-side stale-status clear before
+	 * unmasking (tried first) didn't help, because the card's own line
+	 * stays asserted regardless of what the host's INT_STATUS reads.
+	 * Reverted to NOT asserting SDHCI_INT_CARD_INT here at all; the
+	 * WiFi-slot-specific re-enable now happens explicitly in
+	 * sdhci_resume() below, after mmc_resume_host() returns -- late
+	 * enough that ksdioirqd can actually keep up. */
+	writel(intmask, host->ioaddr + SDHCI_SIGNAL_ENABLE);
 	kobowm_raw_uart_puts("[L9raw] restore_int:post-SIGNAL_EN,EXIT\n");
 }
 
@@ -2223,6 +2206,21 @@ static int sdhci_resume(struct platform_device *pdev)
 			kobowm_raw_uart_puts("[L9raw] resume:post mmc_resume_host\n");
 		if (ret)
 			return ret;
+		/* KoboWM Track L 9 (mds/wifi-hostsleep/trackL-09-*.md, "追記12"):
+		 * SDHCI_INT_CARD_INT is deliberately left masked by
+		 * sdhci_restore_int_regs() above now (see its comment) --
+		 * unmasking it that early livelocked real resume. Re-enable it
+		 * here instead, now that mmc_resume_host() has fully returned
+		 * and dhd.ko's ksdioirqd thread is in a normal, schedulable
+		 * state able to actually service whatever the card is
+		 * signaling, via the same helper (with its own anti-storm
+		 * stale-status check) real SDIO IRQ consumers normally use. */
+		if (2 == pdev->id) {
+			kobowm_raw_uart_puts("[L9raw] resume:pre enable_sdio_irq\n");
+			irq_marker_budget = 10;
+			sdhci_enable_sdio_irq(chip->hosts[i]->mmc, 1);
+			kobowm_raw_uart_puts("[L9raw] resume:post enable_sdio_irq\n");
+		}
 	}
 
 	printk(KERN_ERR "[KoboWM-L9dbg] sdhci_resume EXIT pdev->id=%d\n",
