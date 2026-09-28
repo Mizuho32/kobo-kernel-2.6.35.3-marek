@@ -210,6 +210,14 @@ static void sdhci_dumpregs(struct sdhci_host *host)
  * output if the UART peripheral itself still has clock+power at the call
  * site; silence here (unlike with printk) means the peripheral's own clock
  * is gone by that point, not just the console layer being asleep. */
+
+/* KoboWM Track L 9 "追記11": shared with sdhci_irq() below -- armed with a
+ * fresh budget right before the SIGNAL_ENABLE write inside
+ * sdhci_restore_int_regs() so the rate-limited marker there answers the
+ * bus-stall-vs-IRQ-storm question for THAT specific window, not whichever
+ * budget happened to survive ordinary boot-time SDIO enumeration noise. */
+static int irq_marker_budget;
+
 static void kobowm_raw_uart_puts(const char *s)
 {
 	void __iomem *uart = IO_ADDRESS(UART2_BASE_ADDR);
@@ -423,6 +431,7 @@ static void sdhci_restore_int_regs(struct sdhci_host *host)
 			       host->ioaddr + SDHCI_INT_STATUS);
 	}
 	kobowm_raw_uart_puts("[L9raw] restore_int:post-staleclear,pre-SIGNAL_EN\n");
+	irq_marker_budget = 10;
 	writel(intmask | SDHCI_INT_CARD_INT, host->ioaddr + SDHCI_SIGNAL_ENABLE);
 	kobowm_raw_uart_puts("[L9raw] restore_int:post-SIGNAL_EN,EXIT\n");
 }
@@ -1924,15 +1933,29 @@ static irqreturn_t sdhci_irq(int irq, void *dev_id)
 	struct sdhci_host *host = dev_id;
 	u32 intmask;
 	int cardint = 0;
-	/* KoboWM Track L 9 (mds/wifi-hostsleep/trackL-09-*.md, "追記10"):
-	 * distinguish "writel(SIGNAL_ENABLE) itself never returns" (real bus
-	 * stall) from "it returns fine but sdhci_irq() then storms/loops
-	 * forever, starving the resuming thread" (both look identical from
-	 * outside -- no further raw UART output either way). */
+	/* KoboWM Track L 9 (mds/wifi-hostsleep/trackL-09-*.md, "追記10"/
+	 * "追記11"): distinguish "writel(SIGNAL_ENABLE) itself never
+	 * returns" (real bus stall) from "it returns fine but sdhci_irq()
+	 * then storms/loops forever, starving the resuming thread" (both
+	 * look identical from outside -- no further raw UART output either
+	 * way). An earlier unconditional-every-call version of this marker
+	 * turned out to itself perturb timing badly enough to produce a
+	 * runaway steady-state storm even during plain boot (no suspend/
+	 * resume involved at all) -- kobowm_raw_uart_puts()'s per-call
+	 * busy-wait poll loop is too expensive to run on every entry into a
+	 * hot IRQ handler. Rate-limited to the first few calls per boot so
+	 * it still answers the disambiguation question without being the
+	 * thing that causes a storm. Armed with a fresh budget right before
+	 * the SIGNAL_ENABLE write we're investigating (see
+	 * sdhci_restore_int_regs() above), not a fixed boot-time budget --
+	 * boot-time SDIO enumeration alone burns through a small fixed
+	 * budget before the interesting window is ever reached. */
 	int is_wifi = mxc_fix_chips[2] && mxc_fix_chips[2]->hosts[0] == host;
 
-	if (is_wifi)
+	if (is_wifi && irq_marker_budget > 0) {
+		irq_marker_budget--;
 		kobowm_raw_uart_puts("[L9raw] irq:ENTER\n");
+	}
 
 	spin_lock(&host->lock);
 
