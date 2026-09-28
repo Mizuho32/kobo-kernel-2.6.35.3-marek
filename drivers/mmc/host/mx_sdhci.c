@@ -1924,6 +1924,15 @@ static irqreturn_t sdhci_irq(int irq, void *dev_id)
 	struct sdhci_host *host = dev_id;
 	u32 intmask;
 	int cardint = 0;
+	/* KoboWM Track L 9 (mds/wifi-hostsleep/trackL-09-*.md, "追記10"):
+	 * distinguish "writel(SIGNAL_ENABLE) itself never returns" (real bus
+	 * stall) from "it returns fine but sdhci_irq() then storms/loops
+	 * forever, starving the resuming thread" (both look identical from
+	 * outside -- no further raw UART output either way). */
+	int is_wifi = mxc_fix_chips[2] && mxc_fix_chips[2]->hosts[0] == host;
+
+	if (is_wifi)
+		kobowm_raw_uart_puts("[L9raw] irq:ENTER\n");
 
 	spin_lock(&host->lock);
 
