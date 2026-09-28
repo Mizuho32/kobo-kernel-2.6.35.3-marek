@@ -366,12 +366,19 @@ static void sdhci_restore_int_regs(struct sdhci_host *host)
 
 	if (host->flags & SDHCI_USE_DMA)
 		intmask &= ~(SDHCI_INT_DATA_AVAIL | SDHCI_INT_SPACE_AVAIL);
+	/* KoboWM Track L 9 (mds/wifi-hostsleep/trackL-09-*.md, "追記9"):
+	 * bracket each of this function's 3 register writes individually
+	 * -- the coarser init:post-reset/init:EXIT markers only say the
+	 * hang is SOMEWHERE in this function, not which write. */
+	kobowm_raw_uart_puts("[L9raw] restore_int:pre-WML\n");
 	/* Configure the WML rege */
 	if (mxc_wml_value == 512)
 		writel(SDHCI_WML_128_WORDS, host->ioaddr + SDHCI_WML);
 	else
 		writel(SDHCI_WML_16_WORDS, host->ioaddr + SDHCI_WML);
+	kobowm_raw_uart_puts("[L9raw] restore_int:post-WML,pre-INT_EN\n");
 	writel(intmask | SDHCI_INT_CARD_INT, host->ioaddr + SDHCI_INT_ENABLE);
+	kobowm_raw_uart_puts("[L9raw] restore_int:post-INT_EN,pre-SIGNAL_EN\n");
 	/* KoboWM host-sleep Phase 2: sdhci_resume() calls sdhci_init() (via
 	 * SDHCI_RESET_ALL) on every resume for every slot, including the WiFi
 	 * slot when dhd.ko stayed loaded/associated across a real suspend
@@ -391,6 +398,7 @@ static void sdhci_restore_int_regs(struct sdhci_host *host)
 	 * prior suspend flow rmmod'd dhd.ko first. See
 	 * mds/wifi-hostsleep/phase5-attempt9-*.md. */
 	writel(intmask | SDHCI_INT_CARD_INT, host->ioaddr + SDHCI_SIGNAL_ENABLE);
+	kobowm_raw_uart_puts("[L9raw] restore_int:post-SIGNAL_EN,EXIT\n");
 }
 
 static void sdhci_init(struct sdhci_host *host)
