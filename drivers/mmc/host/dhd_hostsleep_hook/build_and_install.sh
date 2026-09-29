@@ -63,7 +63,13 @@ ssh_cmd() {
     "marek@$DEVICE_IP" "$@" < /dev/null
 }
 
-NATIVE_KO_PATH=/drivers/ntx508/wifi/dhd_hostsleep_hook.ko
+# marek@<device> lands in the Debian chroot, which sees the native rootfs
+# bind-mounted at /host -- so both the module's target directory and rcS
+# need that prefix from here, even though they're native (non-chroot) paths.
+NATIVE_KO_PATH=/host/drivers/ntx508/wifi/dhd_hostsleep_hook.ko
+# Path as it appears inside rcS itself (native, no /host prefix -- rcS runs
+# on the native side, before the Debian chroot is even set up).
+NATIVE_KO_PATH_IN_RCS=/drivers/ntx508/wifi/dhd_hostsleep_hook.ko
 RCS=/host/etc/init.d/rcS
 
 echo "=== Transferring $KO to device ==="
@@ -85,16 +91,16 @@ fi
 echo "Transfer verified: $LOCAL_MD5"
 
 echo "=== Wiring auto-load into $RCS (native side) ==="
-ALREADY_WIRED=$(ssh_cmd "grep -c 'insmod $NATIVE_KO_PATH' $RCS || true")
+ALREADY_WIRED=$(ssh_cmd "grep -c 'insmod $NATIVE_KO_PATH_IN_RCS' $RCS || true")
 if [ "$ALREADY_WIRED" -gt 0 ]; then
   echo "Already wired into rcS ($ALREADY_WIRED insmod line(s)) -- nothing to do."
 else
   ssh_cmd "sudo cp $RCS ${RCS}.pre-hostsleep-hook-autoload-backup"
   # Plain-indented insert (no attempt to match the tab-indentation of the
   # surrounding insmod lines -- cosmetic only, sh doesn't care).
-  ssh_cmd "sudo sed -i '/insmod \\/drivers\\/ntx508\\/wifi\\/dhd\\.ko/a insmod $NATIVE_KO_PATH' $RCS"
+  ssh_cmd "sudo sed -i '/insmod \\/drivers\\/ntx508\\/wifi\\/dhd\\.ko/a insmod $NATIVE_KO_PATH_IN_RCS' $RCS"
   ssh_cmd "sudo sh -n $RCS"
-  ADDED=$(ssh_cmd "grep -c 'insmod $NATIVE_KO_PATH' $RCS || true")
+  ADDED=$(ssh_cmd "grep -c 'insmod $NATIVE_KO_PATH_IN_RCS' $RCS || true")
   echo "Inserted $ADDED insmod line(s) into rcS (syntax verified), backup at ${RCS}.pre-hostsleep-hook-autoload-backup"
 fi
 
