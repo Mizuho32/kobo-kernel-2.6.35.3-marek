@@ -37,8 +37,6 @@
 #include <linux/mmc/mmc.h>
 #include <linux/mmc/card.h>
 #include <linux/mmc/core.h>
-#include <linux/mmc/sdio.h>
-#include <linux/mmc/sdio_func.h>
 #include <linux/clk.h>
 #include <linux/regulator/consumer.h>
 #include <linux/slab.h>
@@ -250,14 +248,11 @@ static void sdhci_reset(struct sdhci_host *host, u8 mask)
 	last_op_dir = 0;
 }
 
-/* KoboWM Track L 8 (mds/wifi-hostsleep/trackL-08-*.md): the interrupt-mask/
- * WML register restore that sdhci_init() does after its sdhci_reset(ALL),
- * factored out so sdhci_init_light() below can perform the same restore
- * WITHOUT ever calling sdhci_reset(SDHCI_RESET_ALL) -- see that function's
- * comment for why. */
-static void sdhci_restore_int_regs(struct sdhci_host *host)
+static void sdhci_init(struct sdhci_host *host)
 {
 	u32 intmask;
+
+	sdhci_reset(host, SDHCI_RESET_ALL);
 
 	intmask = SDHCI_INT_ADMA_ERROR |
 	    SDHCI_INT_DATA_END_BIT | SDHCI_INT_DATA_CRC |
@@ -297,33 +292,6 @@ static void sdhci_restore_int_regs(struct sdhci_host *host)
 	 * prior suspend flow rmmod'd dhd.ko first. See
 	 * mds/wifi-hostsleep/phase5-attempt9-*.md. */
 	writel(intmask | SDHCI_INT_CARD_INT, host->ioaddr + SDHCI_SIGNAL_ENABLE);
-}
-
-static void sdhci_init(struct sdhci_host *host)
-{
-	sdhci_reset(host, SDHCI_RESET_ALL);
-	sdhci_restore_int_regs(host);
-}
-
-/* KoboWM Track L 8 (mds/wifi-hostsleep/trackL-08-*.md): a resume-time
- * host-controller re-init that never calls sdhci_reset(SDHCI_RESET_ALL).
- * trackL-07 established that ANY call to sdhci_reset(ALL) -- even on a
- * fully live, never-suspended system -- reliably kills the WiFi SDIO
- * function's data path (carrier stays UP, ping fails), and that restoring
- * the clock immediately afterward does NOT help: the reset itself (or the
- * instant SD_CLK is cut to an actively-associated, keep-power card) puts
- * the chip into a state only a GPIO power-cycle recovers from, not a
- * register fixup. SDHCI_RESET_ALL exists to recover the HOST CONTROLLER's
- * own register state after ITS power/clock domain was lost -- a concern
- * that's orthogonal to whether the SD card itself is still present
- * (card-detect is handled separately via esdhc_cd_callback/detect_irq, not
- * via this reset). This function skips that reset and only restores the
- * interrupt-mask/WML registers sdhci_init() normally restores -- safe to
- * write unconditionally regardless of whether they were actually lost,
- * and touches nothing clock-related. */
-static void sdhci_init_light(struct sdhci_host *host)
-{
-	sdhci_restore_int_regs(host);
 }
 
 static void sdhci_activate_led(struct sdhci_host *host)
@@ -1942,12 +1910,6 @@ static int sdhci_suspend(struct platform_device *pdev, pm_message_t state)
 	return 0;
 }
 
-/* KoboWM Track L 8 (mds/wifi-hostsleep/trackL-08-*.md): tentative
- * declaration -- the real definition (with proc-toggle plumbing) lives
- * much further down in this file, near kobowm_light_resume, but
- * sdhci_resume() below needs to see it first. */
-static int kobowm_light_hostinit;
-
 static int sdhci_resume(struct platform_device *pdev)
 {
 	struct sdhci_chip *chip;
@@ -1993,27 +1955,7 @@ static int sdhci_resume(struct platform_device *pdev)
 				  chip->hosts[i]);
 		if (ret)
 			return ret;
-		/* Track L 8 (mds/wifi-hostsleep/trackL-08-*.md): for the
-		 * WiFi slot specifically (pdev->id==2), when the card
-		 * negotiated MMC_PM_KEEP_POWER on suspend (i.e. it was never
-		 * actually powered off -- exactly the host-sleep case this
-		 * whole project is about) and the toggle is enabled, skip
-		 * the full sdhci_reset(SDHCI_RESET_ALL) that trackL-07
-		 * confirmed reliably kills the WiFi SDIO data path, and only
-		 * restore the interrupt-mask/WML registers instead. Scoped
-		 * narrowly: internal storage (id!=2) and external SD (id==1,
-		 * already special-cased above, and genuinely removable/
-		 * power-loss-prone unlike the soldered-down WiFi module)
-		 * always get the real full reset, unchanged. */
-		if (pdev->id == 2 && kobowm_light_hostinit &&
-		    (chip->hosts[i]->mmc->pm_flags & MMC_PM_KEEP_POWER)) {
-			printk(KERN_ERR "[KoboWM-light-hostinit] resume: "
-			       "sdhci_init_light() for WiFi slot (no full "
-			       "reset)\n");
-			sdhci_init_light(chip->hosts[i]);
-		} else {
-			sdhci_init(chip->hosts[i]);
-		}
+		sdhci_init(chip->hosts[i]);
 		chip->hosts[i]->init_flag = 2;
 		mmiowb();
 		ret = mmc_resume_host(chip->hosts[i]->mmc);
@@ -2671,9 +2613,6 @@ extern int mmc_io_rw_direct(struct mmc_card *card, int write, unsigned fn,
 extern int mmc_io_rw_extended(struct mmc_card *card, int write, unsigned fn,
 			       unsigned addr, int incr_addr, u8 *buf,
 			       unsigned blocks, unsigned blksz);
-/* Not EXPORT_SYMBOL'd either, same link-time resolution as above. */
-extern void mmc_set_bus_width(struct mmc_host *host, unsigned int width);
-extern void mmc_set_clock(struct mmc_host *host, unsigned int hz);
 
 /* KoboWM Track L (mds/wifi-hostsleep/trackL-01-wiced-evidence-and-pivot.md):
  * toggle for drivers/mmc/core/sdio.c's kobowm_light_resume fast path (skip
@@ -2704,39 +2643,6 @@ static int kobowm_light_resume_read(char *page, char **start, off_t off,
 				     int count, int *eof, void *data)
 {
 	int len = snprintf(page, count, "%d\n", kobowm_light_resume);
-	*eof = 1;
-	return len;
-}
-
-/* KoboWM Track L 8 (mds/wifi-hostsleep/trackL-08-*.md): toggle selecting
- * sdhci_init_light() (skip sdhci_reset(SDHCI_RESET_ALL) entirely) instead
- * of sdhci_init() wherever the resume path re-inits the host controller.
- * Default off so existing test runs (including trackL-07's own bitmask=4
- * reproduction) are unaffected unless explicitly enabled via
- * `echo 1 > /proc/kobowm_light_hostinit`. Same pattern as
- * kobowm_light_resume above. */
-static int kobowm_light_hostinit = 0;
-
-static int kobowm_light_hostinit_write(struct file *file, const char *buf,
-					unsigned long count, void *data)
-{
-	char kbuf[8];
-	unsigned long n = count < sizeof(kbuf) - 1 ? count : sizeof(kbuf) - 1;
-
-	if (copy_from_user(kbuf, buf, n))
-		return -EFAULT;
-	kbuf[n] = '\0';
-
-	kobowm_light_hostinit = simple_strtoul(kbuf, NULL, 10) ? 1 : 0;
-	printk(KERN_ERR "[KoboWM-light-hostinit] kobowm_light_hostinit=%d\n",
-	       kobowm_light_hostinit);
-	return count;
-}
-
-static int kobowm_light_hostinit_read(char *page, char **start, off_t off,
-				       int count, int *eof, void *data)
-{
-	int len = snprintf(page, count, "%d\n", kobowm_light_hostinit);
 	*eof = 1;
 	return len;
 }
@@ -2784,330 +2690,6 @@ static int kobowm_mmc_release_write(struct file *file, const char *buf,
 	}
 	mmc_release_host(chip->hosts[0]->mmc);
 	printk(KERN_ERR "[KoboWM-mmc-release] host released\n");
-	return count;
-}
-
-/* KoboWM Track L (mds/wifi-hostsleep/trackL-06-*.md): decompose
- * sdhci_suspend()/sdhci_resume() into its individual constituent
- * operations and add them ONE AT A TIME to the known-good manual
- * PM_MAX -> wait -> PM_FAST sequence, instead of trying to subtract
- * pieces from the (broken) full suspend/resume. This is the first:
- * free_irq()/request_irq() alone -- during a real suspend/resume this
- * host is completely deaf to the WiFi chip for the whole free_irq..
- * request_irq window (no handler registered at all, more total than the
- * claim-hold in attempt 5, which still left the IRQ handler registered
- * and just made it block on the host mutex). Deliberately does NOT touch
- * bus width, host-controller reinit, or CCCR/CIS -- those are separate,
- * not-yet-tested steps. `echo <dwell_ms> > /proc/kobowm_irq_gap_test`.
- */
-static int kobowm_irq_gap_test_write(struct file *file, const char *buf,
-				      unsigned long count, void *data)
-{
-	struct sdhci_chip *chip = mxc_fix_chips[2];
-	char kbuf[16];
-	unsigned long dwell_ms = 3000;
-	int ret;
-
-	if (!chip || !chip->hosts[0]) {
-		printk(KERN_ERR "[KoboWM-irq-gap] mxc_fix_chips[2] is NULL\n");
-		return count;
-	}
-
-	if (count > 0 && count < sizeof(kbuf)) {
-		if (copy_from_user(kbuf, buf, count))
-			return -EFAULT;
-		kbuf[count] = '\0';
-		{
-			unsigned long val = simple_strtoul(kbuf, NULL, 10);
-			if (val > 1)
-				dwell_ms = val;
-		}
-	}
-
-	printk(KERN_ERR "[KoboWM-irq-gap] free_irq (host now deaf to WiFi "
-	       "chip interrupts)\n");
-	free_irq(chip->hosts[0]->irq, chip->hosts[0]);
-
-	printk(KERN_ERR "[KoboWM-irq-gap] dwelling %lu ms with no IRQ handler "
-	       "registered\n", dwell_ms);
-	msleep(dwell_ms);
-
-	ret = request_irq(chip->hosts[0]->irq, sdhci_irq, IRQF_SHARED,
-			   mmc_hostname(chip->hosts[0]->mmc), chip->hosts[0]);
-	printk(KERN_ERR "[KoboWM-irq-gap] request_irq() returned %d "
-	       "(handler re-registered)\n", ret);
-
-	return count;
-}
-
-/* KoboWM Track L (mds/wifi-hostsleep/trackL-06-*.md): cumulative,
- * bitmask-driven decomposition of sdhci_suspend()/sdhci_resume(). Each
- * bit adds one more real suspend/resume constituent operation, in the
- * same relative order the real functions use, so the host-side sweep
- * script can start from the least-suspicious combination (bit 0 alone,
- * already confirmed harmless in isolation via kobowm_irq_gap_test) and
- * add one more at a time without a kernel rebuild per step:
- *   bit 0 (0x1): IRQ gap -- free_irq() .. dwell .. request_irq()
- *   bit 1 (0x2): bus-width switch -- disable_wide (CMD52, fn0) before
- *                the dwell, enable_wide (CMD52, fn0) after -- replicates
- *                sdio_disable_wide()/sdio_enable_wide() (drivers/mmc/
- *                core/sdio.c) via the same mmc_io_rw_direct() primitive
- *                the liveness probe already uses, since those are static
- *                functions we can't call directly
- *   bit 2 (0x4): host controller reinit -- sdhci_init(), called once
- *                after the dwell (matches sdhci_resume()'s own ordering:
- *                request_irq() then sdhci_init())
- *   bit 3 (0x8): CCCR/CIS reread -- CMD52 + CMD53 (IO_RW_EXTENDED, the
- *                same command class whose timeout has reproduced in
- *                every full-resume dwell sweep) on fn0 addr 0x00,
- *                matching mmc_sdio_init_card()'s real position right
- *                after the host-controller reinit. The one real-resume
- *                constituent Track L had only tested by REMOVAL before
- *                (kobowm_light_resume), never by addition alone.
- *   bit 4 (0x10): per-function dev_pm_ops dispatch -- calls
- *                dhd_hostsleep_hook.c's real .suspend()/.resume()
- *                through func->dev.driver->pm, exactly as
- *                mmc_sdio_suspend()/mmc_sdio_resume() invoke them
- *                (before the bus-width disable on suspend, after the
- *                bus-width enable on resume). Their content is a no-op
- *                log line, but bits 0-3 never exercised this dispatch
- *                path at all -- everything else called primitives
- *                directly under this function's own mmc_claim_host().
- * Claims the host for the duration (recursive-safe, see
- * kobowm_mmc_claim_write's comment) so this can't race against anything
- * else touching the bus mid-test, keeping each step's result attributable
- * to that step alone. `echo "<bitmask> <dwell_ms>" > /proc/kobowm_step_test`.
- */
-static int kobowm_step_test_write(struct file *file, const char *buf,
-				   unsigned long count, void *data)
-{
-	struct sdhci_chip *chip = mxc_fix_chips[2];
-	struct mmc_card *card;
-	char kbuf[32];
-	unsigned long bitmask = 0, dwell_ms = 3000;
-	int ret;
-	u8 ctrl;
-
-	if (!chip || !chip->hosts[0] || !chip->hosts[0]->mmc ||
-	    !chip->hosts[0]->mmc->card) {
-		printk(KERN_ERR "[KoboWM-step-test] mxc_fix_chips[2]/card is "
-		       "NULL\n");
-		return count;
-	}
-	card = chip->hosts[0]->mmc->card;
-
-	if (count > 0 && count < sizeof(kbuf)) {
-		if (copy_from_user(kbuf, buf, count))
-			return -EFAULT;
-		kbuf[count] = '\0';
-		{
-			char *p = kbuf;
-			bitmask = simple_strtoul(p, &p, 10);
-			while (*p == ' ')
-				p++;
-			if (*p)
-				dwell_ms = simple_strtoul(p, NULL, 10);
-			if (dwell_ms < 1)
-				dwell_ms = 3000;
-		}
-	}
-
-	printk(KERN_ERR "[KoboWM-step-test] bitmask=0x%lx dwell=%lu ms\n",
-	       bitmask, dwell_ms);
-
-	/* IMPORTANT correctness fix (mds/wifi-hostsleep/trackL-06-*.md,
-	 * bit-4 addendum): the real mmc_sdio_suspend()/mmc_sdio_resume()
-	 * do NOT hold mmc_claim_host() for their entire duration -- the
-	 * per-function pmops->suspend()/resume() calls run with NO claim
-	 * held at all (mmc_sdio_suspend() calls them before ever claiming;
-	 * mmc_sdio_resume() calls mmc_release_host() *before* its resume
-	 * loop). Only the actual bus-command steps (bus-width switch,
-	 * CCCR/CIS reread) are genuinely claimed. An earlier version of
-	 * this function wrapped the ENTIRE sequence in one outer
-	 * mmc_claim_host()/mmc_release_host() pair, so bit 4's dispatch
-	 * call was accidentally always running under a held claim that the
-	 * real code never holds there -- confounding "does calling the
-	 * no-op callback itself matter" with "does calling it while the
-	 * host happens to be claimed matter". Claim boundaries below now
-	 * match the real functions' exactly. */
-
-	if (bitmask & 0x10) {
-		/* Per-function dev_pm_ops suspend, matching real
-		 * mmc_sdio_suspend()'s position: first thing, NO claim held.
-		 * dhd_hostsleep_hook.c's own .suspend()/.resume() are
-		 * content-wise no-ops (just a dev_info log), but the CALL
-		 * PATH itself -- through func->dev.driver->pm, exactly as
-		 * mmc_sdio_suspend()/mmc_sdio_resume() invoke it -- had never
-		 * been exercised by this decomposition before this bit. */
-		int fi;
-		for (fi = 0; fi < card->sdio_funcs; fi++) {
-			struct sdio_func *f = card->sdio_func[fi];
-			if (f && sdio_func_present(f) && f->dev.driver &&
-			    f->dev.driver->pm && f->dev.driver->pm->suspend) {
-				printk(KERN_ERR "[KoboWM-step-test] fn%d "
-				       "pmops->suspend()\n", f->num);
-				ret = f->dev.driver->pm->suspend(&f->dev);
-				printk(KERN_ERR "[KoboWM-step-test] fn%d "
-				       "pmops->suspend() returned %d\n",
-				       f->num, ret);
-			}
-		}
-	}
-
-	if (bitmask & 0x2) {
-		mmc_claim_host(chip->hosts[0]->mmc);
-		printk(KERN_ERR "[KoboWM-step-test] bus-width: 4bit->1bit "
-		       "(CMD52 fn0)\n");
-		ret = mmc_io_rw_direct(card, 0, 0, SDIO_CCCR_IF, 0, &ctrl);
-		printk(KERN_ERR "[KoboWM-step-test] CCCR_IF read ret=%d "
-		       "val=0x%02x\n", ret, ctrl);
-		if (!ret) {
-			ctrl &= ~SDIO_BUS_WIDTH_4BIT;
-			ctrl |= SDIO_BUS_ASYNC_INT;
-			ret = mmc_io_rw_direct(card, 1, 0, SDIO_CCCR_IF, ctrl,
-						NULL);
-			printk(KERN_ERR "[KoboWM-step-test] CCCR_IF write "
-			       "(1bit) ret=%d\n", ret);
-			mmc_set_bus_width(chip->hosts[0]->mmc,
-					   MMC_BUS_WIDTH_1);
-		}
-		mmc_release_host(chip->hosts[0]->mmc);
-	}
-
-	if (bitmask & 0x1) {
-		printk(KERN_ERR "[KoboWM-step-test] free_irq (host deaf to "
-		       "WiFi chip interrupts)\n");
-		free_irq(chip->hosts[0]->irq, chip->hosts[0]);
-	}
-
-	printk(KERN_ERR "[KoboWM-step-test] dwelling %lu ms\n", dwell_ms);
-	msleep(dwell_ms);
-
-	if (bitmask & 0x1) {
-		ret = request_irq(chip->hosts[0]->irq, sdhci_irq, IRQF_SHARED,
-				   mmc_hostname(chip->hosts[0]->mmc),
-				   chip->hosts[0]);
-		printk(KERN_ERR "[KoboWM-step-test] request_irq() returned "
-		       "%d\n", ret);
-	}
-
-	if (bitmask & 0x4) {
-		/* Track L 8 (mds/wifi-hostsleep/trackL-08-*.md): respects
-		 * kobowm_light_hostinit so the exact same bitmask=4 trial
-		 * can A/B the full-reset path (default, matches trackL-07's
-		 * confirmed reproduction) against sdhci_init_light() (skips
-		 * sdhci_reset(SDHCI_RESET_ALL) entirely) with zero script
-		 * changes, `echo 1 > /proc/kobowm_light_hostinit` toggles
-		 * it. */
-		if (kobowm_light_hostinit) {
-			printk(KERN_ERR "[KoboWM-step-test] "
-			       "sdhci_init_light() (host controller "
-			       "reinit, NO full reset)\n");
-			sdhci_init_light(chip->hosts[0]);
-		} else {
-			printk(KERN_ERR "[KoboWM-step-test] sdhci_init() "
-			       "(host controller reinit)\n");
-			sdhci_init(chip->hosts[0]);
-		}
-
-		if (bitmask & 0x20) {
-			/* Track L 7 (mds/wifi-hostsleep/trackL-07-*.md):
-			 * sdhci_init() -> sdhci_reset(SDHCI_RESET_ALL) zeroes
-			 * host->clock and disables the hardware SD clock
-			 * output. The real powered_resume/keep_power fast
-			 * path (mmc_sdio_init_card() in drivers/mmc/core/
-			 * sdio.c) never calls mmc_set_clock() afterward, so
-			 * the WiFi chip's SDIO clock is left off indefinitely
-			 * -- a candidate explanation for "carrier=UP but
-			 * ping=fail" (netdev state is software-only; actual
-			 * bus transactions silently die with no clock).
-			 * bit5 tests whether restoring the clock IMMEDIATELY
-			 * (minimal glitch duration) prevents the breakage,
-			 * as opposed to bit1's later restore (bitmask=22),
-			 * which did NOT prevent it -- distinguishing "clock
-			 * stays off forever" from "the chip's firmware
-			 * already glitched/hung during the cut, too late to
-			 * fix by restoring clock afterward at all". */
-			printk(KERN_ERR "[KoboWM-step-test] restoring clock "
-			       "immediately (mmc_set_clock, %u Hz)\n",
-			       chip->hosts[0]->mmc->ios.clock);
-			mmc_set_clock(chip->hosts[0]->mmc,
-				      chip->hosts[0]->mmc->ios.clock);
-		}
-	}
-
-	if (bitmask & 0x8) {
-		/* Replicates the CCCR/CIS re-read mmc_sdio_init_card() does
-		 * unconditionally in the real sdhci_resume() path (drivers/
-		 * mmc/core/sdio.c) -- CMD52 read of the CCCR revision
-		 * register plus a CMD53 read of the same address, the same
-		 * *class* of command (IO_RW_EXTENDED) whose timeout has
-		 * reproduced in every full-resume dwell sweep this project
-		 * has run. Placed here, matching mmc_sdio_init_card()'s real
-		 * position right after the host-controller reinit.
-		 */
-		u8 cccr_val;
-		u8 cis_buf[4];
-
-		mmc_claim_host(chip->hosts[0]->mmc);
-
-		printk(KERN_ERR "[KoboWM-step-test] CCCR/CIS reread: CMD52 "
-		       "fn0 addr=0x00\n");
-		ret = mmc_io_rw_direct(card, 0, 0, 0x00, 0, &cccr_val);
-		printk(KERN_ERR "[KoboWM-step-test] CMD52 ret=%d val=0x%02x\n",
-		       ret, cccr_val);
-
-		printk(KERN_ERR "[KoboWM-step-test] CCCR/CIS reread: CMD53 "
-		       "fn0 addr=0x00\n");
-		ret = mmc_io_rw_extended(card, 0, 0, 0x00, 1, cis_buf, 1, 4);
-		printk(KERN_ERR "[KoboWM-step-test] CMD53 ret=%d "
-		       "buf=%02x:%02x:%02x:%02x\n", ret, cis_buf[0],
-		       cis_buf[1], cis_buf[2], cis_buf[3]);
-
-		mmc_release_host(chip->hosts[0]->mmc);
-	}
-
-	if (bitmask & 0x2) {
-		mmc_claim_host(chip->hosts[0]->mmc);
-		printk(KERN_ERR "[KoboWM-step-test] bus-width: 1bit->4bit "
-		       "(CMD52 fn0)\n");
-		ret = mmc_io_rw_direct(card, 0, 0, SDIO_CCCR_IF, 0, &ctrl);
-		printk(KERN_ERR "[KoboWM-step-test] CCCR_IF read ret=%d "
-		       "val=0x%02x\n", ret, ctrl);
-		if (!ret) {
-			ctrl |= SDIO_BUS_WIDTH_4BIT;
-			ret = mmc_io_rw_direct(card, 1, 0, SDIO_CCCR_IF, ctrl,
-						NULL);
-			printk(KERN_ERR "[KoboWM-step-test] CCCR_IF write "
-			       "(4bit) ret=%d\n", ret);
-			mmc_set_bus_width(chip->hosts[0]->mmc,
-					   MMC_BUS_WIDTH_4);
-		}
-		mmc_release_host(chip->hosts[0]->mmc);
-	}
-
-	if (bitmask & 0x10) {
-		/* Per-function dev_pm_ops resume, matching real
-		 * mmc_sdio_resume()'s position: LAST, AFTER mmc_release_host()
-		 * -- no claim held, matching the real function exactly (fixed
-		 * from the earlier, incorrectly-claimed version). */
-		int fi;
-		for (fi = 0; fi < card->sdio_funcs; fi++) {
-			struct sdio_func *f = card->sdio_func[fi];
-			if (f && sdio_func_present(f) && f->dev.driver &&
-			    f->dev.driver->pm && f->dev.driver->pm->resume) {
-				printk(KERN_ERR "[KoboWM-step-test] fn%d "
-				       "pmops->resume()\n", f->num);
-				ret = f->dev.driver->pm->resume(&f->dev);
-				printk(KERN_ERR "[KoboWM-step-test] fn%d "
-				       "pmops->resume() returned %d\n",
-				       f->num, ret);
-			}
-		}
-	}
-
-	printk(KERN_ERR "[KoboWM-step-test] done\n");
-
 	return count;
 }
 
@@ -3268,14 +2850,6 @@ static int __init sdhci_drv_init(void)
 		printk(KERN_ERR "[KoboWM-light-resume] failed to create "
 		       "/proc/kobowm_light_resume\n");
 
-	pe = create_proc_entry("kobowm_light_hostinit", 0644, NULL);
-	if (pe) {
-		pe->write_proc = kobowm_light_hostinit_write;
-		pe->read_proc = kobowm_light_hostinit_read;
-	} else
-		printk(KERN_ERR "[KoboWM-light-hostinit] failed to create "
-		       "/proc/kobowm_light_hostinit\n");
-
 	pe = create_proc_entry("kobowm_mmc_claim", 0200, NULL);
 	if (pe)
 		pe->write_proc = kobowm_mmc_claim_write;
@@ -3290,20 +2864,6 @@ static int __init sdhci_drv_init(void)
 		printk(KERN_ERR "[KoboWM-mmc-release] failed to create "
 		       "/proc/kobowm_mmc_release\n");
 
-	pe = create_proc_entry("kobowm_irq_gap_test", 0200, NULL);
-	if (pe)
-		pe->write_proc = kobowm_irq_gap_test_write;
-	else
-		printk(KERN_ERR "[KoboWM-irq-gap] failed to create "
-		       "/proc/kobowm_irq_gap_test\n");
-
-	pe = create_proc_entry("kobowm_step_test", 0200, NULL);
-	if (pe)
-		pe->write_proc = kobowm_step_test_write;
-	else
-		printk(KERN_ERR "[KoboWM-step-test] failed to create "
-		       "/proc/kobowm_step_test\n");
-
 	return platform_driver_register(&sdhci_driver);
 }
 
@@ -3315,11 +2875,8 @@ static void __exit sdhci_drv_exit(void)
 	remove_proc_entry("kobowm_mmc_liveness", NULL);
 	remove_proc_entry("kobowm_mmc_rescan", NULL);
 	remove_proc_entry("kobowm_light_resume", NULL);
-	remove_proc_entry("kobowm_light_hostinit", NULL);
 	remove_proc_entry("kobowm_mmc_claim", NULL);
 	remove_proc_entry("kobowm_mmc_release", NULL);
-	remove_proc_entry("kobowm_irq_gap_test", NULL);
-	remove_proc_entry("kobowm_step_test", NULL);
 	platform_driver_unregister(&sdhci_driver);
 }
 
