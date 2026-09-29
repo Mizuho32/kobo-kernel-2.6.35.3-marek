@@ -208,9 +208,20 @@ static void sdhci_reset(struct sdhci_host *host, u8 mask)
 			return;
 	}
 
+	/* KoboWM WiFi host-sleep fix (mds/wifi-hostsleep/trackL-09-*.md):
+	 * SDHCI_RESET_ALL's own hw reset clears HOST_CONTROL (bus width) and
+	 * the clock auto-gate-disable bits (PER_EN/HLK_EN/IPG_EN) in
+	 * CLOCK_CONTROL, which breaks the onboard WiFi SDIO chip. Restoring
+	 * them LATER -- e.g. after sdhci_init() fully returns -- does NOT
+	 * prevent the breakage; only restoring them immediately after the hw
+	 * reset completes, before any other register write, does (validated
+	 * across repeated clean chip-power-cycle pseudo-test trials and
+	 * multiple real suspend/resume cycles). So SDHCI_RESET_ALL now also
+	 * saves HOST_CONTROL before the trigger, same as the non-ALL branch
+	 * already did. */
 	if (mask & SDHCI_RESET_ALL)
 		host->clock = 0;
-	else if (host->flags & SDHCI_CD_PRESENT)
+	if ((mask & SDHCI_RESET_ALL) || (host->flags & SDHCI_CD_PRESENT))
 		reg_save = readl(host->ioaddr + SDHCI_HOST_CONTROL);
 
 	tmp = readl(host->ioaddr + SDHCI_CLOCK_CONTROL) | (mask << 24);
@@ -231,12 +242,31 @@ static void sdhci_reset(struct sdhci_host *host, u8 mask)
 		tmp--;
 		udelay(20);
 	}
-	/*
-	 * The INT_EN SIG_EN regs have been modified after reset.
-	 * re-configure them ag.
-	 */
-	if (!(mask & SDHCI_RESET_ALL) && (host->flags & SDHCI_CD_PRESENT))
+	if (mask & SDHCI_RESET_ALL) {
+		/* Restore the clock auto-gate-disable bits and bus width
+		 * immediately, before anything else -- see comment above.
+		 * SD_EN and the clock divider bits are deliberately left
+		 * alone (already read back correctly after the reset).
+		 * The settling delay is a guess (no datasheet timing spec
+		 * at hand) -- confirmed necessary on real hardware: a real
+		 * (cold) suspend/resume genuinely loses and restores the
+		 * clock/power domain, unlike a live already-clocked system,
+		 * and skipping this delay intermittently hard-hung real
+		 * suspend/resume (writing HOST_CONTROL right after would
+		 * race the clock domain settling). */
+		u32 clk_now = readl(host->ioaddr + SDHCI_CLOCK_CONTROL);
+		writel(clk_now | SDHCI_CLOCK_PER_EN | SDHCI_CLOCK_HLK_EN |
+			       SDHCI_CLOCK_IPG_EN,
+		       host->ioaddr + SDHCI_CLOCK_CONTROL);
+		mdelay(2);
 		writel(reg_save, host->ioaddr + SDHCI_HOST_CONTROL);
+	} else if (host->flags & SDHCI_CD_PRESENT) {
+		/*
+		 * The INT_EN SIG_EN regs have been modified after reset.
+		 * re-configure them ag.
+		 */
+		writel(reg_save, host->ioaddr + SDHCI_HOST_CONTROL);
+	}
 	if (host->flags & SDHCI_USE_DMA)
 		mask_u32 &= ~(SDHCI_INT_DATA_AVAIL | SDHCI_INT_SPACE_AVAIL);
 	if (mxc_wml_value == 512)
@@ -273,25 +303,22 @@ static void sdhci_init(struct sdhci_host *host)
 	else
 		writel(SDHCI_WML_16_WORDS, host->ioaddr + SDHCI_WML);
 	writel(intmask | SDHCI_INT_CARD_INT, host->ioaddr + SDHCI_INT_ENABLE);
-	/* KoboWM host-sleep Phase 2: sdhci_resume() calls sdhci_init() (via
-	 * SDHCI_RESET_ALL) on every resume for every slot, including the WiFi
-	 * slot when dhd.ko stayed loaded/associated across a real suspend
-	 * (mds/wifi-hostsleep/). This SIGNAL_ENABLE write used to omit
-	 * SDHCI_INT_CARD_INT, unlike the INT_ENABLE write two lines up and
-	 * unlike sdhci_enable_sdio_irq() below (which always writes the same
-	 * mask to both registers). INT_ENABLE only lets the status bit latch;
-	 * SIGNAL_ENABLE is what actually asserts the CPU interrupt line, so
-	 * SDIO card interrupts stopped reaching the CPU after any resume that
-	 * runs this path. mmc_sdio_resume() (drivers/mmc/core/sdio.c) never
-	 * re-calls host->ops->enable_sdio_irq() to fix this, and that
-	 * function's own host->sdio_enable refcount doesn't drop to 0 across
-	 * a normal resume either, so nothing else re-asserts the bit. This
-	 * went unnoticed until host-sleep because it's the first scenario
-	 * where an MMC_CAP_SDIO_IRQ consumer (dhd.ko) stays loaded across a
-	 * real suspend/resume that reaches this code path at all -- every
-	 * prior suspend flow rmmod'd dhd.ko first. See
-	 * mds/wifi-hostsleep/phase5-attempt9-*.md. */
-	writel(intmask | SDHCI_INT_CARD_INT, host->ioaddr + SDHCI_SIGNAL_ENABLE);
+	/* KoboWM WiFi host-sleep fix (mds/wifi-hostsleep/trackL-09-*.md):
+	 * an earlier attempt at this fix (Phase 2) OR'd SDHCI_INT_CARD_INT
+	 * into this SIGNAL_ENABLE write too, to work around SDIO card
+	 * interrupts not reaching the CPU after a real suspend/resume with
+	 * dhd.ko kept loaded (mmc_sdio_resume() never re-calls
+	 * host->ops->enable_sdio_irq() to fix this on its own). That caused
+	 * a genuine IRQ livelock instead: unmasking CARD_INT here --
+	 * immediately post-reset, before dhd.ko's ksdioirqd thread is
+	 * scheduled/ready to service anything -- lets the WiFi chip's
+	 * still-asserted SDIO interrupt line re-trigger sdhci_irq()
+	 * continuously, starving the resuming thread of CPU forever.
+	 * Left at the original intmask (no CARD_INT) here; sdhci_resume()
+	 * now explicitly calls sdhci_enable_sdio_irq() for the WiFi slot
+	 * after mmc_resume_host() returns instead, late enough that
+	 * ksdioirqd can actually keep up. */
+	writel(intmask, host->ioaddr + SDHCI_SIGNAL_ENABLE);
 }
 
 static void sdhci_activate_led(struct sdhci_host *host)
@@ -1961,6 +1988,17 @@ static int sdhci_resume(struct platform_device *pdev)
 		ret = mmc_resume_host(chip->hosts[i]->mmc);
 		if (ret)
 			return ret;
+		/* KoboWM WiFi host-sleep fix (mds/wifi-hostsleep/trackL-09-*.md):
+		 * sdhci_reset()'s SDHCI_RESET_ALL branch deliberately leaves
+		 * SDHCI_INT_CARD_INT masked (see its comment) -- unmasking it
+		 * that early livelocked real resume. Re-enable it here
+		 * instead, now that mmc_resume_host() has fully returned and
+		 * dhd.ko's ksdioirqd thread is in a normal, schedulable state
+		 * able to actually service whatever the card is signaling,
+		 * via the same helper (with its own anti-storm stale-status
+		 * check) real SDIO IRQ consumers normally use. */
+		if (pdev->id == 2)
+			sdhci_enable_sdio_irq(chip->hosts[i]->mmc, 1);
 	}
 
 	return 0;
