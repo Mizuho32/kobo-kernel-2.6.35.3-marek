@@ -27,3 +27,11 @@ In the config - framebuffer console is enabled (you need to pass "console=tty0" 
 4)
 
 Touch driver (zForce infra red) is enhanced to support multitouch (two fingers). For compatibility with original kobo software it sends both - multitouch and singletouch events now.
+
+5)
+
+WiFi (SDIO) host-sleep support.
+
+Every resume from suspend re-runs the MMC host controller's full reset (SDHCI_RESET_ALL), which was corrupting the onboard WiFi chip's bus width and clock auto-gate settings, and a follow-up fix for missed SDIO card interrupts after resume caused the CPU to lock up servicing a continuous interrupt storm instead. Both are fixed now in mx_sdhci.c (sdhci_reset()/sdhci_resume()), so the WiFi chip can stay powered and associated to its access point across a real suspend/resume cycle instead of needing to be reloaded from scratch every time.
+
+The stock WiFi driver (dhd.ko) never implements suspend/resume power management itself, so a small separate module (drivers/mmc/host/dhd_hostsleep_hook/) attaches it at runtime without touching dhd.ko's own source or binary. See drivers/mmc/host/dhd_hostsleep_hook/dhd_hostsleep_hook.c and build_and_install.sh there for building/installing it.
